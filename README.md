@@ -15,8 +15,6 @@ and assembly are `November.DI`.
 - `Tests/EditMode/` — the container contract tests and component-resolution
   tests.
 
-No game code is included.
-
 ## Requirements
 
 - Unity 6000.0 or newer.
