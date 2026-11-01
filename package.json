@@ -1,0 +1,24 @@
+{
+  "name": "com.woolongok.november",
+  "version": "1.0.0",
+  "displayName": "November DI",
+  "description": "A lightweight Unity dependency injection container with constructor, field, and method injection, scoped lifetimes, prefab instantiation, and [Resolve] component lookup.",
+  "unity": "6000.0",
+  "unityRelease": "0f1",
+  "keywords": [
+    "dependency-injection",
+    "di",
+    "ioc",
+    "container",
+    "unity"
+  ],
+  "author": {
+    "name": "Woolongok",
+    "url": "https://github.com/Woolongok"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Woolongok/November.git"
+  },
+  "documentationUrl": "https://github.com/Woolongok/November#readme"
+}

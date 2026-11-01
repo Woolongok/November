@@ -1,0 +1,53 @@
+# Unity package repository.
+# The package itself lives at the repository root, so a host project's
+# generated folders are only relevant when this repo is opened directly.
+
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+.utmp/
+
+# Generated Unity project files
+*.csproj
+*.sln
+*.slnx
+*.unityproj
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.user
+*.userprefs
+*.suo
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.code-workspace
+*.DotSettings.user
+
+# Test and coverage output
+test-results/
+TestResults/
+[Cc]overage/
+*.trx
+*.coverage
+*.coveragexml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local package tarballs
+*.tgz
