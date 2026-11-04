@@ -1,4 +1,5 @@
-# This workflow was added but has not yet been run. Configure the Unity secrets before use.
+# The .NET rig job runs without secrets. The Unity jobs need the GameCI secrets
+# and the repository variable UNITY_CI_ENABLED=true; the IL2CPP job is manual.
 name: Unity package CI
 
 on:
@@ -9,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       run_il2cpp:
-        description: Build an optional Linux IL2CPP player
+        description: Build and run an optional Linux IL2CPP player
         required: false
         type: boolean
         default: false
@@ -18,9 +19,28 @@ permissions:
   contents: read
 
 jobs:
+  rig:
+    name: .NET rig tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run runtime and test suite
+        run: dotnet run --project Tools~/rig/rig.csproj -p:RuntimeDir=../../Runtime -p:TestsDir=../../Tests
+
   tests:
     name: ${{ matrix.testMode }} tests
+    needs: rig
+    if: ${{ vars.UNITY_CI_ENABLED == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -62,10 +82,11 @@ jobs:
           retention-days: 14
 
   il2cpp:
-    name: Optional Linux IL2CPP player build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_il2cpp }}
-    needs: tests
+    name: Optional Linux IL2CPP player build and smoke run
+    needs: rig
+    if: ${{ vars.UNITY_CI_ENABLED == 'true' && github.event_name == 'workflow_dispatch' && inputs.run_il2cpp }}
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -94,26 +115,58 @@ jobs:
           {
               private void Awake()
               {
-                  using (var container = new DiContainer())
+                  try
                   {
-                      container.Register<NovemberIl2CppService>(Lifetime.Singleton);
-                      Func<NovemberIl2CppService> factory = container.Resolve<Func<NovemberIl2CppService>>();
-                      Lazy<NovemberIl2CppService> lazy = container.Resolve<Lazy<NovemberIl2CppService>>();
-                      if (factory() == null || lazy.Value == null)
-                          throw new InvalidOperationException("November DI IL2CPP smoke test failed.");
+                      using (var container = new DiContainer())
+                      {
+                          container.Register<NovemberIl2CppDependency>(Lifetime.Singleton);
+                          container.Register<NovemberIl2CppService>(Lifetime.Singleton);
+                          Func<NovemberIl2CppService> factory = container.Resolve<Func<NovemberIl2CppService>>();
+                          Lazy<NovemberIl2CppService> lazy = container.Resolve<Lazy<NovemberIl2CppService>>();
+                          NovemberIl2CppService resolved = factory();
+                          if (resolved == null || !resolved.IsInjected || lazy.Value == null)
+                              throw new InvalidOperationException("November DI IL2CPP smoke test failed.");
+                      }
+
+                      Debug.Log("NOVEMBER_IL2CPP_SMOKE_OK");
+                      Application.Quit(0);
+                  }
+                  catch (Exception ex)
+                  {
+                      Debug.LogException(ex);
+                      Application.Quit(1);
                   }
               }
           }
 
           [Preserve]
+          public sealed class NovemberIl2CppDependency
+          {
+          }
+
+          [Preserve]
           public sealed class NovemberIl2CppService
           {
-              public NovemberIl2CppService() { }
+              [Inject] private NovemberIl2CppDependency _dependency;
+
+              public bool IsInjected => _dependency != null;
+
+              [Inject]
+              private NovemberIl2CppService() { }
           }
+          EOF
+          cat > "$project/Assets/link.xml" <<'EOF'
+          <linker>
+            <assembly fullname="Assembly-CSharp">
+              <type fullname="NovemberIl2CppDependency" preserve="all" />
+              <type fullname="NovemberIl2CppService" preserve="all" />
+            </assembly>
+          </linker>
           EOF
           cat > "$project/Assets/Editor/NovemberIl2CppBuild.cs" <<'EOF'
           using System;
           using UnityEditor;
+          using UnityEditor.Build;
           using UnityEditor.Build.Reporting;
           using UnityEditor.SceneManagement;
           using UnityEngine;
@@ -136,16 +189,20 @@ jobs:
                       };
 
                       PlayerSettings.SetScriptingBackend(
-                          BuildTargetGroup.Standalone,
+                          NamedBuildTarget.Standalone,
                           ScriptingImplementation.IL2CPP);
                       PlayerSettings.SetManagedStrippingLevel(
-                          BuildTargetGroup.Standalone,
+                          NamedBuildTarget.Standalone,
                           ManagedStrippingLevel.High);
+
+                      string projectRoot = System.IO.Path.GetDirectoryName(Application.dataPath);
+                      string outputDirectory = System.IO.Path.Combine(projectRoot, "artifacts/il2cpp");
+                      System.IO.Directory.CreateDirectory(outputDirectory);
 
                       BuildReport report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
                       {
                           scenes = new[] { scenePath },
-                          locationPathName = "Build/NovemberIl2CppSmoke.x86_64",
+                          locationPathName = System.IO.Path.Combine(outputDirectory, "NovemberIl2CppSmoke.x86_64"),
                           target = BuildTarget.StandaloneLinux64,
                           options = BuildOptions.None
                       });
@@ -171,11 +228,31 @@ jobs:
           buildsPath: artifacts/il2cpp
           allowDirtyBuild: true
 
+      - name: Run the IL2CPP player headlessly
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+          player="$(find .ci/Il2CppProject/artifacts -name NovemberIl2CppSmoke.x86_64 -type f -print -quit)"
+          test -n "$player"
+          chmod +x "$player"
+
+          mkdir -p .ci/il2cpp-logs
+          timeout 180s xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
+            "$player" -batchmode -nographics -logFile - | tee .ci/il2cpp-logs/player.log
+
+          grep -q "NOVEMBER_IL2CPP_SMOKE_OK" .ci/il2cpp-logs/player.log
+
       - name: Upload IL2CPP player
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-il2cpp-player
-          path: artifacts/il2cpp
+          path: |
+            .ci/Il2CppProject/artifacts/il2cpp
+            .ci/il2cpp-logs
           if-no-files-found: ignore
           retention-days: 14

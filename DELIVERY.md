@@ -86,7 +86,7 @@ The delivery was integrated into the package repository at its root:
 | M36 | README.md — scopes/ownership, duplicates/Replace, ResolveAll, injection order/required fields, Resolve clearing, field-target properties documented | Relevant behavioral tests: lifetime, duplicate registration, ResolveAll, injection-order and auto-property tests | README §§Registration and resolution, Injection, [Resolve], Scopes and disposal; CHANGELOG lines 131–132 | documentation updated |
 | M37 | Tests/EditMode and Tests/PlayMode — expanded coverage for listed gaps | Coverage includes prefab/hierarchy, destroyed instances, ctor selection, optional parameters, collections, dispose, scopes, captive dependencies and TryResolve thread/disposal | README §Tests; CHANGELOG lines 100–101 | test sources present; execution unverified |
 | M38 | ResolutionState.cs — TryResolve miss counts/warnings are per root, not process-wide static | DiContainerRegistrationTests.TryResolve_Miss_WarnsOncePerTypePerContainer_ButCountsEveryMiss; TryResolve_Warning_IsNotSharedAcrossContainers | README §Registration and resolution; CHANGELOG lines 65–68, 129–130 | implemented; execution unverified |
-| M39 | /.github/workflows/ci.yml — GameCI EditMode/PlayMode package tests and optional IL2CPP player build | CI workflow itself; not executed | README §Tests / CI; CHANGELOG lines 90–92 | workflow written; not run; GitHub Unity secrets required |
+| M39 | /.github/workflows/ci.yml — secret-free .NET rig job; gated GameCI EditMode/PlayMode package tests; manual IL2CPP player build with a headless smoke run | CI workflow itself; not executed | README §Tests; CHANGELOG lines 93–97 | workflow written; not run; GitHub Unity secrets and `UNITY_CI_ENABLED` required |
 | M40 | CHANGELOG.md + package.json — v2.0.0 and changelogUrl; no license decision made | Package manifest parse/static check; no automated test | README installation/upgrade; CHANGELOG.md; package.json | partial by owner decision: license/field intentionally omitted; tag not created |
 
 ## Needs Unity verification
@@ -155,7 +155,7 @@ The delivery was integrated into the package repository at its root:
 - **License:** owner must choose a license before adding a `LICENSE` file or `license` field. Neither has been added.
 - **Version tag:** decide whether to publish/tag `v2.0.0` (no tag was created).
 - **Unity metadata:** provide the original `.meta` files (or allow a connected GitHub repository read) to restore existing GUIDs, plus the original `.gitignore`.
-- **CI:** configure `UNITY_LICENSE`, `UNITY_EMAIL`, and `UNITY_PASSWORD` secrets; then run the workflow. The optional IL2CPP job is manual (`run_il2cpp`).
+- **CI:** the .NET rig job runs without secrets. For the Unity jobs, configure `UNITY_LICENSE`, `UNITY_EMAIL`, and `UNITY_PASSWORD`, then set the repository variable `UNITY_CI_ENABLED=true`; the manual IL2CPP job also needs `run_il2cpp` on a workflow dispatch. Nothing has been run on GitHub Actions.
 - **M6 scope:** keyed registrations and open-generic registrations remain unsupported; decide whether to add them or explicitly keep them out of the 2.0.0 scope.
 - **Optional package content:** `Samples~/` and `Documentation~/` were not added.
 

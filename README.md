@@ -22,8 +22,9 @@ tooling. The public namespace and assembly are `November.DI`.
 - `CHANGELOG.md` — what changed, including breaking changes.
 - `Tools~/rig/` — the .NET verification rig and mutation definitions; the
   trailing `~` keeps Unity from compiling the rig's engine stubs.
-- `.github/workflows/ci.yml` — GameCI EditMode / PlayMode tests and an optional
-  IL2CPP player build.
+- `.github/workflows/ci.yml` — a secret-free .NET rig job, GameCI EditMode /
+  PlayMode jobs gated by the `UNITY_CI_ENABLED` repository variable, and a manual
+  Linux IL2CPP player build with a headless smoke run.
 
 ## Requirements
 
@@ -427,12 +428,33 @@ To run the tests in a host project, add the package to `testables` in
 Then open **Window > General > Test Runner** and run the EditMode and PlayMode
 suites.
 
-The GitHub Actions workflow runs both suites in UPM package mode with Unity
-`6000.0.85f1`. Add the repository secrets `UNITY_LICENSE`, `UNITY_EMAIL`, and
-`UNITY_PASSWORD`; GameCI cannot authenticate the Editor until they are configured.
-An optional high-stripping Linux IL2CPP player build can be started manually with
-the `run_il2cpp` workflow input; it is disabled by default. The workflow added
-for this release has not yet been run.
+### Continuous integration
+
+The `.NET rig tests` GitHub Actions job needs no secrets: it installs .NET 8 and
+runs the runtime and source tests against the engine stubs in `Tools~/rig` on
+every push and pull request. Run the same check locally with:
+
+```bash
+dotnet run --project Tools~/rig/rig.csproj \
+  -p:RuntimeDir=../../Runtime -p:TestsDir=../../Tests
+```
+
+The Unity `editmode` and `playmode` jobs run both suites in UPM package mode with
+Unity `6000.0.85f1` through GameCI. They only start when the repository variable
+`UNITY_CI_ENABLED` is set to `true`, and they require the repository secrets
+`UNITY_LICENSE`, `UNITY_EMAIL`, and `UNITY_PASSWORD`; GameCI cannot authenticate
+the Editor without them. Leave the variable unset on a repository whose secrets
+are not configured, because a gated job that tries to authenticate fails rather
+than skipping. Pull requests from forks cannot read secrets even when the variable
+is set.
+
+The `il2cpp` job is manual: start the workflow with **Run workflow**, enable
+`run_il2cpp`, and it builds a high-stripping Linux IL2CPP player against the same
+Unity version, runs it headlessly under `xvfb-run`, and fails unless the player
+exits successfully within three minutes and logs its completion marker. It is
+gated by the same `UNITY_CI_ENABLED` variable. The workflow has not yet run in
+this repository, and a passing rig run does not replace real Unity or IL2CPP
+verification.
 
 ## Upgrading
 

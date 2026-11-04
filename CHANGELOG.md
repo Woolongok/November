@@ -91,8 +91,10 @@ to do about it.
 - `Runtime/link.xml` and `[Preserve]` on the reflection entry points for IL2CPP
   code stripping.
 - PlayMode tests for prefab injection before `Awake`, a log-counting test helper,
-  and a GitHub Actions workflow for EditMode / PlayMode tests with an optional
-  IL2CPP player build. The workflow has not yet been run.
+  and a GitHub Actions workflow with a secret-free .NET rig job. The GameCI
+  EditMode / PlayMode jobs are gated by the `UNITY_CI_ENABLED` repository variable;
+  the manual IL2CPP job builds a high-stripping Linux player and runs it headlessly.
+  The workflow has not yet run.
 
 ### Changed
 
