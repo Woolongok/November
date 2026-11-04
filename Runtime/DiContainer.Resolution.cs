@@ -173,7 +173,10 @@ namespace November.DI
             if (_instances != null && _instances.TryGetValue(descriptor, out var existing))
             {
                 // Scene objects die with their scene: never hand out a destroyed Unity object.
-                if (!IsDestroyedUnityObject(existing)) return existing;
+                // A borrowed factory result must also stop being served once its real owner was
+                // disposed (for example a root singleton cached by a child forwarding factory).
+                if (!IsDestroyedUnityObject(existing) && !ObjectOwnership.IsOwnedByDisposedContainer(existing))
+                    return existing;
                 _instances.Remove(descriptor);
             }
 

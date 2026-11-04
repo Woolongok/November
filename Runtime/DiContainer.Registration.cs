@@ -108,6 +108,11 @@ namespace November.DI
                     $"Instance of '{instance.GetType().FullName}' is not assignable to '{serviceType.FullName}'.",
                     nameof(instance));
 
+            // Caller-owned: a factory that forwards this object later must not claim it, and this
+            // container must not dispose it even if it was previously tracked by the same scope.
+            ObjectOwnership.MarkExternal(instance);
+            ForgetTrackedInstance(instance);
+
             AddDescriptor(serviceType, ServiceDescriptor.ForInstance(serviceType, instance), mode);
         }
 

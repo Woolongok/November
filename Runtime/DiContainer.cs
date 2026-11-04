@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace November.DI
 {
@@ -17,6 +18,9 @@ namespace November.DI
     ///   registration lives on an ancestor.
     /// - Transient: built by the resolving scope; a disposable one is tracked by that scope.
     /// - RegisterInstance: owned by the caller; never injected, never disposed.
+    /// - RegisterFactory: the result is owned by the container that built it, unless the object
+    ///   already belongs to another container or was registered as an instance. A factory that
+    ///   forwards a parent singleton therefore cannot transfer ownership to a child scope.
     ///
     /// File layout (one partial type):
     ///   DiContainer.cs              — fields, construction.
@@ -38,8 +42,8 @@ namespace November.DI
         private Dictionary<Type, List<ServiceDescriptor>> _registry;
         private Dictionary<ServiceDescriptor, object> _instances;
         private List<object> _disposables;
-        private HashSet<object> _tracked;
         private bool _disposed;
+        private Task _disposeTask;
 
         /// <summary>
         /// Creates a root container, or a scope when <paramref name="parent"/> is given

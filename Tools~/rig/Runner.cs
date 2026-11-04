@@ -19,6 +19,14 @@ namespace Rig
             return e is AssertionException ? e.Message : $"{e.GetType().Name}: {e.Message.Split('\n')[0]}";
         }
 
+        // Unity coroutines can yield another IEnumerator; drive nested waits as well. The rig has no
+        // frame loop, so tests that need real asynchrony use short sleeps before yielding.
+        private static void Drive(IEnumerator enumerator)
+        {
+            while (enumerator.MoveNext())
+                if (enumerator.Current is IEnumerator nested) Drive(nested);
+        }
+
         public static int Main(string[] args)
         {
             string filter = args.Length > 0 ? args[0] : null;
@@ -47,7 +55,7 @@ namespace Rig
                     {
                         foreach (var m in setUps) m.Invoke(instance, null);
                         var result = test.Invoke(instance, null);
-                        if (result is IEnumerator e) while (e.MoveNext()) { }   // [UnityTest]: yields are ignored
+                        if (result is IEnumerator e) Drive(e);   // [UnityTest]: nested coroutines run to completion
                     }
                     catch (Exception ex) { error = Describe(ex); }
                     finally
