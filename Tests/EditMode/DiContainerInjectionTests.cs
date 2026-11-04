@@ -180,6 +180,56 @@ namespace November.DI.Tests
             public void Dispose() => Disposed++;
         }
 
+        private sealed class StaticInjectField
+        {
+            [Inject] public static IDep Dep;
+        }
+
+        private sealed class StaticInjectMethod
+        {
+            [Inject] public static void Init(IDep dep) { }
+        }
+
+        private sealed class StaticResolveField
+        {
+            [Resolve] public static IDep Dep;
+        }
+
+        private sealed class GenericInjectMethod
+        {
+            [Inject] public void Init<T>(T value) { }
+        }
+
+        private sealed class FieldOrderProbe
+        {
+            public static List<string> Log = new List<string>();
+            [Inject] public FieldOrderFirst First;
+            [Inject] public FieldOrderSecond Second;
+        }
+
+        private sealed class FieldOrderFirst
+        {
+            public FieldOrderFirst() => FieldOrderProbe.Log.Add("first");
+        }
+
+        private sealed class FieldOrderSecond
+        {
+            public FieldOrderSecond() => FieldOrderProbe.Log.Add("second");
+        }
+
+        private sealed class MethodOrderProbe
+        {
+            public static List<string> Log = new List<string>();
+            [Inject] public void Zebra() => Log.Add("zebra");
+            [Inject] public void Alpha() => Log.Add("alpha");
+        }
+
+        private sealed class ReInjectable
+        {
+            public int Injections;
+            [Inject] public void Init() => Injections++;
+        }
+
         private sealed class FieldCycleA { [Inject] public FieldCycleB B; }
         private sealed class FieldCycleB { [Inject] public FieldCycleA A; }
 
@@ -723,6 +773,96 @@ namespace November.DI.Tests
             Assert.IsTrue(InjectionQuery.TypeNeedsAnyInjection(typeof(Ordered)));
             Assert.IsFalse(InjectionQuery.TypeNeedsAnyInjection(typeof(DepImpl)));
             Assert.IsFalse(InjectionQuery.TypeNeedsAnyInjection(typeof(string)));
+        }
+
+        [Test]
+        public void StaticInjectField_IsRejectedInsteadOfSilentlyIgnored()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                InjectionQuery.TypeNeedsAnyInjection(typeof(StaticInjectField)));
+
+            Assert.IsTrue(ex.Message.Contains("static"), ex.Message);
+            Assert.IsTrue(ex.Message.Contains("Dep"), ex.Message);
+        }
+
+        [Test]
+        public void StaticInjectMethod_IsRejectedInsteadOfSilentlyIgnored()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                InjectionQuery.TypeNeedsAnyInjection(typeof(StaticInjectMethod)));
+
+            Assert.IsTrue(ex.Message.Contains("static"), ex.Message);
+            Assert.IsTrue(ex.Message.Contains("Init"), ex.Message);
+        }
+
+        [Test]
+        public void StaticResolveField_IsRejectedInsteadOfSilentlyIgnored()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                InjectionQuery.TypeNeedsAnyInjection(typeof(StaticResolveField)));
+
+            Assert.IsTrue(ex.Message.Contains("static"), ex.Message);
+            Assert.IsTrue(ex.Message.Contains("Resolve"), ex.Message);
+        }
+
+        [Test]
+        public void GenericInjectMethod_IsRejectedInsteadOfSilentlyIgnored()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                InjectionQuery.TypeNeedsAnyInjection(typeof(GenericInjectMethod)));
+
+            Assert.IsTrue(ex.Message.Contains("generic"), ex.Message);
+            Assert.IsTrue(ex.Message.Contains("Init"), ex.Message);
+        }
+
+        [Test]
+        public void InjectFields_RunInDeclarationOrder()
+        {
+            _container.Register<FieldOrderFirst>();
+            _container.Register<FieldOrderSecond>();
+            _container.Register<FieldOrderProbe>();
+            FieldOrderProbe.Log.Clear();
+
+            _container.Resolve<FieldOrderProbe>();
+
+            CollectionAssert.AreEqual(new[] { "first", "second" }, FieldOrderProbe.Log);
+        }
+
+        [Test]
+        public void InjectMethods_RunInDeclarationOrder()
+        {
+            MethodOrderProbe.Log.Clear();
+
+            _container.InjectInto(new MethodOrderProbe());
+
+            CollectionAssert.AreEqual(new[] { "zebra", "alpha" }, MethodOrderProbe.Log);
+        }
+
+        [Test]
+        public void MetadataCacheReset_InvalidatesInjectionMarkers()
+        {
+            var instance = new ReInjectable();
+
+            using (var first = new DiContainer())
+            {
+                first.RegisterFactory<ReInjectable>(p => instance, Lifetime.Singleton);
+                Assert.AreSame(instance, first.Resolve<ReInjectable>());
+            }
+
+            Assert.AreEqual(1, instance.Injections);
+
+            // Simulates the start of a new play session with domain reload disabled: plans and
+            // static caches survive, but the previous session's injection markers must not.
+            InjectionMetadata.ClearCache();
+
+            using (var second = new DiContainer())
+            {
+                second.RegisterFactory<ReInjectable>(p => instance, Lifetime.Singleton);
+                Assert.AreSame(instance, second.Resolve<ReInjectable>());
+            }
+
+            Assert.AreEqual(2, instance.Injections,
+                "an object marked by the previous static-cache generation must be injected again");
         }
 
         [Test]

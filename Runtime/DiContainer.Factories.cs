@@ -81,6 +81,7 @@ namespace November.DI
         {
             s_funcCreators.Clear();
             s_lazyCreators.Clear();
+            ResetInjectionMarkers();
         }
     }
 }

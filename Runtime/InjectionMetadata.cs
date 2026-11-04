@@ -145,6 +145,9 @@ namespace November.DI
         private const BindingFlags DeclaredMembers =
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
 
+        private const BindingFlags StaticDeclaredMembers =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
         private static readonly Dictionary<Type, TypePlan> s_plans = new Dictionary<Type, TypePlan>();
 
         public static TypePlan GetPlan(Type type)
@@ -186,8 +189,10 @@ namespace November.DI
             for (int h = 0; h < hierarchy.Count; h++)
             {
                 var current = hierarchy[h];
+                RejectUnsupportedMembers(current);
 
                 var fields = current.GetFields(DeclaredMembers);
+                SortMembers(fields);
                 for (int i = 0; i < fields.Length; i++)
                 {
                     var field = fields[i];
@@ -199,11 +204,16 @@ namespace November.DI
                 }
 
                 var methods = current.GetMethods(DeclaredMembers);
+                SortMembers(methods);
                 for (int i = 0; i < methods.Length; i++)
                 {
                     var method = methods[i];
-                    if (!method.IsDefined(typeof(InjectAttribute), false) || method.IsGenericMethodDefinition)
-                        continue;
+                    if (!method.IsDefined(typeof(InjectAttribute), false)) continue;
+                    if (method.IsGenericMethodDefinition)
+                        throw new InvalidOperationException(
+                            $"[DiContainer] [Inject] method '{method.Name}' on '{current.FullName}' is generic. " +
+                            "Generic [Inject] methods are not supported; use a non-generic method, or inject the " +
+                            "dependency through a field or constructor.");
 
                     // A virtual method and its overrides share one base definition. Invoking the
                     // base MethodInfo already dispatches to the override, so run the body once.
@@ -221,6 +231,60 @@ namespace November.DI
                 injectMethods != null ? injectMethods.ToArray() : Array.Empty<InjectMethodPlan>(),
                 resolveFields != null ? resolveFields.ToArray() : Array.Empty<ResolveFieldPlan>());
         }
+
+        /// <summary>
+        /// Reflection returns members in no guaranteed order, so the plan fixes it to declaration
+        /// order (metadata token, then name) to make field and method injection repeatable.
+        /// </summary>
+        private static void SortMembers<T>(T[] members) where T : MemberInfo
+            => Array.Sort(members, CompareMembers);
+
+        private static int CompareMembers(MemberInfo left, MemberInfo right)
+        {
+            int token = MetadataTokenOf(left).CompareTo(MetadataTokenOf(right));
+            return token != 0 ? token : string.CompareOrdinal(left.Name, right.Name);
+        }
+
+        private static int MetadataTokenOf(MemberInfo member)
+        {
+            try { return member.MetadataToken; }
+            catch (InvalidOperationException) { return 0; } // metadata emitted dynamically; fall back to the name
+        }
+
+        /// <summary>
+        /// Static and generic injection members cannot work: the version with BindingFlags.Instance
+        /// silently skipped them, which hid a broken configuration until much later. Fail when the
+        /// plan is built instead.
+        /// </summary>
+        private static void RejectUnsupportedMembers(Type current)
+        {
+            var fields = current.GetFields(StaticDeclaredMembers);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                var field = fields[i];
+                if (field.IsDefined(typeof(InjectAttribute), false))
+                    throw InvalidMember(current, "[Inject] field", field.Name,
+                        "is static. Static fields cannot be injected; remove [Inject] or make the field an instance member.");
+                if (field.IsDefined(typeof(ResolveAttribute), false))
+                    throw InvalidMember(current, "[Resolve] field", field.Name,
+                        "is static. Static fields cannot be resolved from a GameObject hierarchy; remove [Resolve] or make the field an instance member.");
+            }
+
+            var methods = current.GetMethods(StaticDeclaredMembers);
+            for (int i = 0; i < methods.Length; i++)
+                if (methods[i].IsDefined(typeof(InjectAttribute), false))
+                    throw InvalidMember(current, "[Inject] method", methods[i].Name,
+                        "is static. Static methods cannot be injected; remove [Inject] or make the method an instance member.");
+
+            var constructors = current.GetConstructors(StaticDeclaredMembers);
+            for (int i = 0; i < constructors.Length; i++)
+                if (constructors[i].IsDefined(typeof(InjectAttribute), false))
+                    throw InvalidMember(current, "[Inject] static constructor", "cctor",
+                        "cannot be injected; [Inject] constructors must be instance constructors.");
+        }
+
+        private static InvalidOperationException InvalidMember(Type owner, string kind, string member, string reason)
+            => new InvalidOperationException($"[DiContainer] {kind} '{member}' on '{owner.FullName}' {reason}");
 
         private static bool TryPlanResolveField(FieldInfo field, Type owner, out ResolveFieldPlan plan)
         {

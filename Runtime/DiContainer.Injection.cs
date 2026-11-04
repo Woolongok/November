@@ -17,8 +17,10 @@ namespace November.DI
     {
         // Objects the container has already injected AND cached (singleton / scoped). A factory that hands
         // one of them back (a forwarding factory) must not get a second injection. Weak: costs no lifetime.
+        // The marker is an epoch token: ClearStaticCaches replaces it, so entries written by a previous
+        // play session (domain reload disabled) can never be mistaken for injections from this one.
         private static readonly ConditionalWeakTable<object, object> s_injected = new ConditionalWeakTable<object, object>();
-        private static readonly object s_injectedMarker = new object();
+        private static object s_injectedMarker = new object();
 
         // Reusable buffers for hierarchy injection. Main thread only; a stack because injection can nest.
         private static readonly Stack<List<MonoBehaviour>> s_buffers = new Stack<List<MonoBehaviour>>();
@@ -43,8 +45,7 @@ namespace November.DI
                         ValidateFactoryResult(descriptor, instance);
 
                     var plan = InjectionMetadata.GetPlan(instance.GetType());
-                    bool alreadyInjected = descriptor.Kind == DescriptorKind.Factory
-                                           && s_injected.TryGetValue(instance, out _);
+                    bool alreadyInjected = descriptor.Kind == DescriptorKind.Factory && WasInjected(instance);
                     if (plan.NeedsAnyInjection && !alreadyInjected)
                         InjectCore(instance, plan);
 
@@ -230,7 +231,20 @@ namespace November.DI
         private static void MarkInjected(object instance)
         {
             if (!InjectionMetadata.GetPlan(instance.GetType()).NeedsAnyInjection) return;
-            if (!s_injected.TryGetValue(instance, out _)) s_injected.Add(instance, s_injectedMarker);
+            if (WasInjected(instance)) return;
+
+            // Replace an entry from a previous epoch (the table cannot hold two values for one key).
+            s_injected.Remove(instance);
+            s_injected.Add(instance, s_injectedMarker);
+        }
+
+        private static bool WasInjected(object instance)
+            => s_injected.TryGetValue(instance, out var marker) && ReferenceEquals(marker, s_injectedMarker);
+
+        /// <summary>Starts a new injection-marker epoch; called when the static caches are reset.</summary>
+        internal static void ResetInjectionMarkers()
+        {
+            s_injectedMarker = new object();
         }
 
         // ── Prefabs and hierarchies ─────────────────────────────────────────
