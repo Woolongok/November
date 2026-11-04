@@ -148,8 +148,42 @@ namespace UnityEngine
         public override bool Equals(object other) => other is Object o ? this == o : (other == null && Destroyed);
         public override int GetHashCode() => base.GetHashCode();
 
-        public static void DestroyImmediate(Object o) { if (!ReferenceEquals(o, null)) o.Destroyed = true; }
-        public static void Destroy(Object o) => DestroyImmediate(o);
+        private static readonly List<Object> PendingDestroys = new List<Object>();
+
+        public static void DestroyImmediate(Object o)
+        {
+            if (ReferenceEquals(o, null) || o.Destroyed) return;
+
+            if (o is GameObject gameObject)
+            {
+                // Unity destroys the whole hierarchy: components and child GameObjects included.
+                var components = gameObject.ComponentList.ToList();
+                var children = gameObject.transform.ChildList.ToList();
+                foreach (var child in children) DestroyImmediate(child.gameObject);
+                foreach (var component in components) component.Destroyed = true;
+                gameObject.Destroyed = true;
+                return;
+            }
+
+            o.Destroyed = true;
+        }
+
+        // Unity defers Destroy to the end of the frame; the rig processes it on each coroutine yield.
+        public static void Destroy(Object o)
+        {
+            if (ReferenceEquals(o, null) || o.Destroyed) return;
+            if (!PendingDestroys.Contains(o)) PendingDestroys.Add(o);
+        }
+
+        internal static void ProcessPendingDestroys()
+        {
+            if (PendingDestroys.Count == 0) return;
+
+            var pending = PendingDestroys.ToArray();
+            PendingDestroys.Clear();
+            foreach (var o in pending) DestroyImmediate(o);
+        }
+
         public static void DontDestroyOnLoad(Object o) { }
 
         // Unity's Instantiate of an asset: a NEW managed object (constructor runs) with the serialized fields copied.
@@ -210,6 +244,7 @@ namespace UnityEngine
         internal readonly List<Transform> ChildList = new List<Transform>();
         public Transform parent { get; private set; }
         public int childCount => ChildList.Count;
+        public Transform GetChild(int index) => ChildList[index];
 
         internal void SetParentNoAwake(Transform p)
         {
@@ -277,6 +312,9 @@ namespace UnityEngine
                 }
             return null;
         }
+
+        public Component GetComponent(Type type) => FindOnSelf(type);
+        public T GetComponent<T>() where T : class => (T)(object)FindOnSelf(typeof(T));
 
         public T GetComponentInChildren<T>(bool includeInactive) => (T)(object)FindInChildren(typeof(T), includeInactive);
 

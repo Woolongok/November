@@ -269,6 +269,56 @@ namespace November.DI.Tests.PlayMode
             Assert.IsTrue(FailingProbe.Created[0] == null, "the half-injected instance must not be left behind");
         }
 
+        [UnityTest]
+        public IEnumerator InstantiatePrefab_WhenComponentInjectionFails_DestroysTheClonedRootHierarchy()
+        {
+            var template = NewTemplate("failing hierarchy");
+            var failing = template.AddComponent<FailingProbe>();
+            template.AddComponent<CountedProbe>();
+            var child = new GameObject("child");
+            child.transform.SetParent(template.transform, false);
+            child.AddComponent<ProbeChild>();
+            FailingProbe.Created.Clear();
+
+            Assert.Throws<InvalidOperationException>(() => _container.InstantiatePrefab(failing));
+
+            // Destroy is deferred in play mode: capture the clone graph before the frame ends.
+            var cloneRoot = FailingProbe.Created[0].gameObject;
+            var cloneSibling = cloneRoot.GetComponent<CountedProbe>();
+            var cloneChild = cloneRoot.transform.GetChild(0).gameObject;
+            var cloneChildProbe = cloneChild.GetComponent<ProbeChild>();
+
+            yield return null;
+
+            Assert.IsTrue(cloneRoot == null, "the cloned root GameObject must be destroyed");
+            Assert.IsTrue(cloneSibling == null, "sibling components must not survive the clone");
+            Assert.IsTrue(cloneChild == null, "child GameObjects must not survive the clone");
+            Assert.IsTrue(cloneChildProbe == null, "child components must not survive the clone");
+
+            Assert.IsTrue(failing != null, "the source prefab is untouched");
+            Assert.IsTrue(template != null, "the source hierarchy is untouched");
+        }
+
+        [UnityTest]
+        public IEnumerator InstantiatePrefab_OfAGameObject_WhenInjectionFails_DestroysTheClonedRoot()
+        {
+            var template = NewTemplate("failing root");
+            template.AddComponent<FailingProbe>();
+            var child = new GameObject("child");
+            child.transform.SetParent(template.transform, false);
+            child.AddComponent<ProbeChild>();
+            FailingProbe.Created.Clear();
+
+            Assert.Throws<InvalidOperationException>(() => _container.InstantiatePrefab(template));
+
+            var cloneRoot = FailingProbe.Created[0].gameObject;
+
+            yield return null;
+
+            Assert.IsTrue(cloneRoot == null, "the GameObject overload must destroy the cloned root too");
+            Assert.IsTrue(template != null, "the source prefab is untouched");
+        }
+
         [Test]
         public void InjectGameObjectHierarchy_InjectsAnExistingHierarchy_IncludingInactiveChildren()
         {

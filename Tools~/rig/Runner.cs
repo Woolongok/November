@@ -24,7 +24,10 @@ namespace Rig
         private static void Drive(IEnumerator enumerator)
         {
             while (enumerator.MoveNext())
+            {
                 if (enumerator.Current is IEnumerator nested) Drive(nested);
+                else UnityEngine.Object.ProcessPendingDestroys();
+            }
         }
 
         public static int Main(string[] args)

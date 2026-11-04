@@ -209,7 +209,9 @@ namespace November.DI
             try { InjectHierarchyCore(root); }
             catch
             {
-                DestroyObject(instance);
+                // instance can be a Component; destroying only that component would leave the
+                // cloned GameObject, its other components and its children alive.
+                DestroyObject(root);
                 throw;
             }
 
