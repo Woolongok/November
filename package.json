@@ -5,6 +5,7 @@
   "description": "A lightweight Unity dependency injection container with constructor, field, and method injection, scoped lifetimes, prefab instantiation, and [Resolve] component lookup.",
   "unity": "6000.0",
   "unityRelease": "0f1",
+  "license": "MIT",
   "keywords": [
     "dependency-injection",
     "di",

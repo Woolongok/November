@@ -462,3 +462,9 @@ See [CHANGELOG.md](CHANGELOG.md) for breaking changes. The short version:
 `IServiceProvider` is now `IDiProvider`, a second `Register` for a type throws
 unless you use `Replace`, and transient disposables are now disposed by the scope
 that resolved them.
+
+## License
+
+November DI is released under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Woolongok.

@@ -95,6 +95,7 @@ to do about it.
   EditMode / PlayMode jobs are gated by the `UNITY_CI_ENABLED` repository variable;
   the manual IL2CPP job builds a high-stripping Linux player and runs it headlessly.
   The workflow has not yet run.
+- An MIT `LICENSE` file and the matching `license` field in `package.json`.
 
 ### Changed
 
