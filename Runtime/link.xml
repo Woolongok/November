@@ -1,0 +1,13 @@
+<!--
+  Keeps November.DI itself intact under managed code stripping (IL2CPP / WebGL).
+  The container reaches its own generic helpers (Func<T> / Lazy<T> wrappers) only
+  through reflection, and a stripped build would otherwise remove them.
+
+  This does NOT preserve YOUR types: constructors, [Inject] members and [Resolve]
+  fields that are only touched by reflection can still be stripped. Mark them with
+  [UnityEngine.Scripting.Preserve] or list them in your project's own link.xml
+  (see README, "IL2CPP and stripping").
+-->
+<linker>
+  <assembly fullname="November.DI" preserve="all" />
+</linker>

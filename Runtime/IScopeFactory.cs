@@ -1,30 +1,23 @@
-using System;
-
 namespace November.DI
 {
-
     /// <summary>
-    /// Abstraction for creating child scopes from a DI container.
-    /// Enables scoped lifetime management without depending on the concrete container.
-    /// Follows the Dependency Inversion and Interface Segregation Principles.
+    /// Abstraction for creating child scopes from a DI container. Consumers that only
+    /// need to open a scope depend on this and do not get a <c>Dispose</c> method they
+    /// must not call (the scope that is returned is the thing to dispose).
     ///
-    /// ═══ Scope Lifecycle ═══════════════════════════════════════════
-    /// - Each call to CreateScope creates an independent child scope.
-    /// - Child scopes inherit all parent registrations and can add/override their own.
-    /// - Disposing a scope releases only its own scoped and singleton instances.
-    /// - ⚠️  Parent containers do NOT track child scopes. Disposing a parent does
-    ///   NOT cascade disposal to its children. Each scope must be disposed independently.
-    ///   This is intentional — scopes are standalone lifetime boundaries (e.g. one per
-    ///   scene or one per entity), and the parent should not outlive them.
-    /// ════════════════════════════════════════════════════════════════
+    /// Scope lifecycle:
+    /// - Each call creates an independent child scope that inherits parent registrations
+    ///   and may add or override its own.
+    /// - Disposing a scope releases only what that scope owns.
+    /// - Parents do NOT track children: disposing a parent does not cascade. Dispose child
+    ///   scopes before their parent; a singleton owned by a disposed parent can no longer
+    ///   be resolved from a still-live child.
     /// </summary>
-    public interface IScopeFactory : IDisposable
+    public interface IScopeFactory
     {
         /// <summary>
         /// Creates a child scope that inherits parent registrations.
-        /// The returned IDiScope supports registration, resolution, and injection
-        /// within the scope boundary.
-        /// Throws ObjectDisposedException if the parent container has been disposed.
+        /// Throws <see cref="System.ObjectDisposedException"/> if the parent is disposed.
         /// </summary>
         IDiScope CreateScope();
     }

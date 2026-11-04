@@ -1,6 +1,6 @@
 {
   "name": "com.woolongok.november",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "displayName": "November DI",
   "description": "A lightweight Unity dependency injection container with constructor, field, and method injection, scoped lifetimes, prefab instantiation, and [Resolve] component lookup.",
   "unity": "6000.0",
@@ -20,5 +20,6 @@
     "type": "git",
     "url": "https://github.com/Woolongok/November.git"
   },
-  "documentationUrl": "https://github.com/Woolongok/November#readme"
+  "documentationUrl": "https://github.com/Woolongok/November#readme",
+  "changelogUrl": "https://github.com/Woolongok/November/blob/main/CHANGELOG.md"
 }

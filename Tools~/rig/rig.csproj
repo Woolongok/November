@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <UseAppHost>false</UseAppHost>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <StartupObject>Rig.Runner</StartupObject>
+    <!-- Mimic the Unity Editor: the tests asmdef is Editor-only. -->
+    <DefineConstants>$(DefineConstants);UNITY_EDITOR;UNITY_INCLUDE_TESTS</DefineConstants>
+    <NoWarn>CS1570;CS1587;CS0660;CS0661;CS0414;CS0169;CS0649;CS0219;CS8981;CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- RuntimeDir / TestsDir are passed on the command line so the same rig can run old and new code. -->
+    <Compile Include="$(RuntimeDir)/**/*.cs" />
+    <Compile Include="$(TestsDir)/**/*.cs" />
+    <Compile Include="*.cs" />
+  </ItemGroup>
+</Project>

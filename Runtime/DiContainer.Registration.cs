@@ -4,134 +4,170 @@ using UnityEngine;
 
 namespace November.DI
 {
-
     /// <summary>
-    /// DiContainer registration partition: Register / RegisterInstance /
-    /// RegisterFactory plus descriptor bookkeeping.
-    /// Same type via partial — no behaviour change.
+    /// Registration partition: Register / Add / Replace for types, instances, factories and aliases.
     /// </summary>
-    public sealed partial class DiContainer : IDiScope, IServiceProvider, IScopeFactory
+    public sealed partial class DiContainer
     {
-        public void Register<TService, TImpl>(Lifetime lifetime = Lifetime.Transient)
-            where TImpl : class, TService
+        private enum RegistrationMode
         {
-            var implType = typeof(TImpl);
-            if (implType.IsAbstract || implType.IsInterface)
-                throw new ArgumentException(
-                    $"Implementation type '{implType.FullName}' must be a concrete, non-abstract type.");
-            AssertNotUnityComponent(implType);
-
-            AddDescriptor(typeof(TService), new ServiceDescriptor(implType, lifetime));
+            /// <summary>Single binding: a second one in the same container is a duplicate.</summary>
+            Register,
+            /// <summary>Swap every existing binding for the type.</summary>
+            Replace,
+            /// <summary>Append (multi-binding).</summary>
+            Append
         }
 
+        // ── Types ───────────────────────────────────────────────────────────
+        public void Register<TService, TImpl>(Lifetime lifetime = Lifetime.Transient)
+            where TImpl : class, TService
+            => RegisterType(typeof(TService), typeof(TImpl), lifetime, RegistrationMode.Register);
+
         public void Register(Type serviceType, Type implType, Lifetime lifetime = Lifetime.Transient)
+            => RegisterType(serviceType, implType, lifetime, RegistrationMode.Register);
+
+        public void Add(Type serviceType, Type implType, Lifetime lifetime = Lifetime.Transient)
+            => RegisterType(serviceType, implType, lifetime, RegistrationMode.Append);
+
+        public void Replace(Type serviceType, Type implType, Lifetime lifetime = Lifetime.Transient)
+            => RegisterType(serviceType, implType, lifetime, RegistrationMode.Replace);
+
+        // ── Instances ───────────────────────────────────────────────────────
+        public void RegisterInstance<TService>(TService instance)
+            => RegisterInstanceCore(typeof(TService), instance, RegistrationMode.Register);
+
+        public void RegisterInstance(Type serviceType, object instance)
+            => RegisterInstanceCore(serviceType, instance, RegistrationMode.Register);
+
+        public void ReplaceInstance(Type serviceType, object instance)
+            => RegisterInstanceCore(serviceType, instance, RegistrationMode.Replace);
+
+        // ── Factories ───────────────────────────────────────────────────────
+        public void RegisterFactory<TService>(Func<IDiProvider, TService> factory, Lifetime lifetime = Lifetime.Transient)
         {
+            ThrowIfDisposed();
+            MainThread.Assert(nameof(RegisterFactory));
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+            RegisterFactoryCore(typeof(TService), p => factory(p), lifetime, RegistrationMode.Register);
+        }
+
+        public void RegisterFactory(Type serviceType, Func<IDiProvider, object> factory, Lifetime lifetime = Lifetime.Transient)
+            => RegisterFactoryCore(serviceType, factory, lifetime, RegistrationMode.Register);
+
+        public void ReplaceFactory(Type serviceType, Func<IDiProvider, object> factory, Lifetime lifetime = Lifetime.Transient)
+            => RegisterFactoryCore(serviceType, factory, lifetime, RegistrationMode.Replace);
+
+        // ── Aliases ─────────────────────────────────────────────────────────
+        public void RegisterAlias(Type aliasType, Type targetType)
+        {
+            ThrowIfDisposed();
+            MainThread.Assert(nameof(RegisterAlias));
+            if (aliasType == null) throw new ArgumentNullException(nameof(aliasType));
+            if (targetType == null) throw new ArgumentNullException(nameof(targetType));
+            if (aliasType == targetType)
+                throw new ArgumentException($"An alias cannot point at itself ('{aliasType.FullName}').", nameof(targetType));
+
+            AddDescriptor(aliasType, ServiceDescriptor.ForAlias(aliasType, targetType), RegistrationMode.Register);
+        }
+
+        // ── Shared implementation ───────────────────────────────────────────
+        private void RegisterType(Type serviceType, Type implType, Lifetime lifetime, RegistrationMode mode)
+        {
+            ThrowIfDisposed();
+            MainThread.Assert(nameof(Register));
             if (serviceType == null) throw new ArgumentNullException(nameof(serviceType));
             if (implType == null) throw new ArgumentNullException(nameof(implType));
+
             if (implType.IsAbstract || implType.IsInterface)
                 throw new ArgumentException(
                     $"Implementation type '{implType.FullName}' must be a concrete, non-abstract type.",
                     nameof(implType));
+            if (implType.IsValueType || implType.ContainsGenericParameters || serviceType.ContainsGenericParameters)
+                throw new ArgumentException(
+                    $"Cannot register '{serviceType.FullName}' -> '{implType.FullName}': implementations must be closed classes " +
+                    "(structs and open generic types are not supported; register the closed type).",
+                    nameof(implType));
             if (!serviceType.IsAssignableFrom(implType))
                 throw new ArgumentException(
                     $"'{implType.FullName}' does not implement or extend '{serviceType.FullName}'.");
-            AssertNotUnityComponent(implType);
+            AssertNotUnityObject(implType);
 
-            AddDescriptor(serviceType, new ServiceDescriptor(implType, lifetime));
+            AddDescriptor(serviceType, ServiceDescriptor.ForType(serviceType, implType, lifetime), mode);
         }
 
-        public void RegisterInstance<TService>(TService instance)
+        private void RegisterInstanceCore(Type serviceType, object instance, RegistrationMode mode)
         {
-            if (instance == null || (instance is UnityEngine.Object unityObject && unityObject == null))
+            ThrowIfDisposed();
+            MainThread.Assert(nameof(RegisterInstance));
+            if (serviceType == null) throw new ArgumentNullException(nameof(serviceType));
+            if (instance == null || IsDestroyedUnityObject(instance))
                 throw new ArgumentNullException(nameof(instance), "Cannot register a null or destroyed Unity object.");
-            var type = typeof(TService);
-
-            if (_registry.TryGetValue(type, out var existingDescriptors))
-            {
-                object cachedInstance = null;
-                if (existingDescriptors.Count > 0 && existingDescriptors[^1].IsExternalInstance)
-                {
-                    if (!_singletons.TryGetValue(type, out cachedInstance))
-                        cachedInstance = existingDescriptors[^1].Factory?.Invoke(this);
-                }
-                bool cachedInstanceWasDestroyed = cachedInstance is UnityEngine.Object cachedUnityObject
-                    && cachedUnityObject == null;
-                if (!cachedInstanceWasDestroyed)
-                    throw new InvalidOperationException(
-                        $"[DiContainer] A registration for '{type.FullName}' already exists. " +
-                        "Call RegisterInstance only once per type per container.");
-
-                // Scene-owned Unity objects can be destroyed while a long-lived
-                // scope still holds their external registration. Permit the owner
-                // to replace that dead reference with its live scene instance.
-                _registry.Remove(type);
-                _singletons.Remove(type);
-            }
-
-            if (_registry.ContainsKey(type))
-                throw new InvalidOperationException(
-                    $"[DiContainer] A registration for '{type.FullName}' already exists. " +
-                    "Call RegisterInstance only once per type per container.");
-
-            var descriptor = new ServiceDescriptor(
-                type,
-                Lifetime.Singleton,
-                factory: _ => (object)instance,
-                isExternalInstance: true);
-
-            _singletons[type] = instance;
-            AddDescriptor(type, descriptor);
-        }
-
-        public void RegisterFactory<TService>(
-            Func<IServiceProvider, TService> factory,
-            Lifetime lifetime = Lifetime.Transient)
-        {
-            if (factory == null) throw new ArgumentNullException(nameof(factory));
-            AddDescriptor(typeof(TService),
-                new ServiceDescriptor(typeof(TService), lifetime, c => factory(c)));
-        }
-
-        private void AddDescriptor(Type serviceType, ServiceDescriptor descriptor)
-        {
-            if (_registry.TryGetValue(serviceType, out var list))
-            {
-                // Register/RegisterFactory: REPLACING an existing descriptor is deliberate —
-                // it keeps stale descriptors from accumulating across scene reloads.
-                // (RegisterInstance is intentionally different: it THROWS on duplicates,
-                // because the same external instance registered twice is always a wiring bug.)
-                // Single-bind contract: after Clear()+Add only one descriptor remains, so
-                // ResolveAll returns the parent chain + this one entry (never two local
-                // bindings). Warn so an accidental double-Register is visible in
-                // Editor AND builds (Warning level: observable without failing runs).
-                if (list.Count > 0)
-                {
-                    Debug.LogWarning($"[DiContainer] Replacing registration for '{serviceType.FullName}' (previous descriptor discarded). This is expected across scene reloads; if unexpected, check for a duplicate Register call.");
-                    // The previous singleton/scoped value belongs to the replaced
-                    // descriptor; retaining it could return a destroyed scene object
-                    // after the new binding has been installed.
-                    _singletons.Remove(serviceType);
-                    _scoped.Remove(serviceType);
-                }
-                list.Clear();
-                list.Add(descriptor);
-            }
-            else
-            {
-                list = new List<ServiceDescriptor>(1);
-                list.Add(descriptor);
-                _registry[serviceType] = list;
-            }
-        }
-
-        private static void AssertNotUnityComponent(Type implType)
-        {
-            if (typeof(Component).IsAssignableFrom(implType))
+            if (!serviceType.IsInstanceOfType(instance))
                 throw new ArgumentException(
-                    $"'{implType.FullName}' derives from UnityEngine.Component and cannot be " +
-                    "constructor-injected via Register(...). " +
-                    "Use RegisterInstance(...) or InstantiatePrefab/InjectGameObjectHierarchy.");
+                    $"Instance of '{instance.GetType().FullName}' is not assignable to '{serviceType.FullName}'.",
+                    nameof(instance));
+
+            AddDescriptor(serviceType, ServiceDescriptor.ForInstance(serviceType, instance), mode);
+        }
+
+        private void RegisterFactoryCore(Type serviceType, Func<IDiProvider, object> factory, Lifetime lifetime, RegistrationMode mode)
+        {
+            ThrowIfDisposed();
+            MainThread.Assert(nameof(RegisterFactory));
+            if (serviceType == null) throw new ArgumentNullException(nameof(serviceType));
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+
+            AddDescriptor(serviceType, ServiceDescriptor.ForFactory(serviceType, factory, lifetime), mode);
+        }
+
+        private void AddDescriptor(Type serviceType, ServiceDescriptor descriptor, RegistrationMode mode)
+        {
+            if (_registry == null) _registry = new Dictionary<Type, List<ServiceDescriptor>>();
+
+            if (!_registry.TryGetValue(serviceType, out var list) || list.Count == 0 || mode == RegistrationMode.Append)
+            {
+                if (list == null) _registry[serviceType] = list = new List<ServiceDescriptor>(1);
+                list.Add(descriptor);
+                return;
+            }
+
+            // An owner may re-register a scene object whose previous registration died with its scene.
+            bool replacesDeadInstance = list.Count == 1 && list[0].IsDestroyedInstance;
+
+            if (mode == RegistrationMode.Register && !replacesDeadInstance)
+            {
+                // Legacy behaviour only for type/factory/alias bindings: a live external instance is
+                // never replaced silently.
+                bool legacyReplace = _options.DuplicateRegistrations == DuplicateRegistrationPolicy.ReplaceWithWarning
+                                     && descriptor.Kind != DescriptorKind.Instance;
+                if (!legacyReplace) throw Duplicate(serviceType);
+
+                Debug.LogWarning(
+                    $"[DiContainer] Replacing registration for '{serviceType.FullName}' (previous binding discarded). " +
+                    "Use Replace(...) when this is intended.");
+            }
+
+            // Replace / dead instance / legacy replace: swap every binding and drop their cached instances.
+            for (int i = 0; i < list.Count; i++)
+                if (_instances != null) _instances.Remove(list[i]);
+            list.Clear();
+            list.Add(descriptor);
+        }
+
+        private static InvalidOperationException Duplicate(Type serviceType)
+            => new InvalidOperationException(
+                $"[DiContainer] A registration for '{serviceType.FullName}' already exists in this container. " +
+                "Use Replace(...) to override it on purpose, Add(...) to register several implementations, " +
+                "or register it in a child scope to shadow it.");
+
+        private static void AssertNotUnityObject(Type implType)
+        {
+            if (typeof(UnityEngine.Object).IsAssignableFrom(implType))
+                throw new ArgumentException(
+                    $"'{implType.FullName}' derives from UnityEngine.Object (Component, ScriptableObject, ...) and cannot be " +
+                    "created with a constructor. Use RegisterInstance(...), a RegisterFactory(...) that calls " +
+                    "AddComponent / ScriptableObject.CreateInstance, or InstantiatePrefab.");
         }
     }
-
 }

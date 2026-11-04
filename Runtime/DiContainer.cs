@@ -1,89 +1,112 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 
 namespace November.DI
 {
-
     /// <summary>
-    /// Dependency Injection container implementing all DI interfaces.
+    /// Dependency injection container. Single-threaded by design: use it from the Unity main
+    /// thread only (checked in the Editor and development builds).
     ///
-    /// SOLID compliance:
-    ///   S — Single Responsibility via interface segregation (each interface = one concern).
-    ///   I — Interface Segregation: IServiceRegistry / IServiceResolver / IInjector / IScopeFactory.
-    ///   D — Dependency Inversion: consumers depend on abstractions, not this concrete class.
+    /// Ownership model
+    /// - A registration is a <see cref="ServiceDescriptor"/>; instance caches are keyed by descriptor,
+    ///   never by service type, so a replaced or shadowed registration cannot serve a stale instance.
+    /// - Singleton: built by the container that owns the registration, from that container's view
+    ///   of the registrations; cached and disposed there.
+    /// - Scoped:    built, cached and disposed by the scope that RESOLVES it, even when the
+    ///   registration lives on an ancestor.
+    /// - Transient: built by the resolving scope; a disposable one is tracked by that scope.
+    /// - RegisterInstance: owned by the caller; never injected, never disposed.
     ///
-    /// Efficiency:
-    ///   - No thread-safety overhead (Unity is single-threaded on the main thread).
-    ///   - All reflection metadata cached via InjectionMetadata (pre-populated at class init).
-    ///   - Plain Dictionary lookups instead of ConcurrentDictionary.
-    ///   - No ThreadLocal allocations — shared HashSet with try/finally.
-    ///   - Constructor delegate cached per type (AOT-safe ctor.Invoke for IL2CPP).
-    ///
-    /// File layout (same partial type — zero behaviour change vs the old god file):
-    ///   DiContainer.cs — fields, scope chain, construction (this file).
-    ///   DiContainer.Registration.cs — Register / RegisterInstance / RegisterFactory.
-    ///   DiContainer.Resolution.cs — Resolve / TryResolve / ResolveAll / dispatch.
-    ///   DiContainer.Injection.cs — creation, [Inject]/[Resolve], prefab, scopes.
-    ///   DiContainer.Factories.cs — Func&lt;T&gt; / Lazy&lt;T&gt; support.
-    ///   DiContainer.Disposal.cs — teardown and guards.
+    /// File layout (one partial type):
+    ///   DiContainer.cs              — fields, construction.
+    ///   DiContainer.Registration.cs — Register / Add / Replace / RegisterInstance / RegisterFactory / RegisterAlias.
+    ///   DiContainer.Resolution.cs   — Resolve / TryResolve / ResolveAll and lifetime dispatch.
+    ///   DiContainer.Injection.cs    — construction, [Inject] / [Resolve] injection, prefabs, scopes.
+    ///   DiContainer.Factories.cs    — Func&lt;T&gt; / Lazy&lt;T&gt; support.
+    ///   DiContainer.Disposal.cs     — Dispose / DisposeAsync and disposal tracking.
+    ///   DiContainer.Validation.cs   — Validate() and DescribeRegistrations().
+    ///   DiContainer.Diagnostics.cs  — resolution paths and error construction.
     /// </summary>
-    public sealed partial class DiContainer : IDiScope, IServiceProvider, IScopeFactory
+    public sealed partial class DiContainer : IDiScope
     {
         private readonly DiContainer _parent;
+        private readonly ResolutionState _state;       // shared by the whole parent/child chain
+        private readonly DiContainerOptions _options;  // shared by the chain unless a scope overrides it
 
-        // ── Registries: plain Dictionary, no thread-safety overhead ──────
-        private readonly Dictionary<Type, List<ServiceDescriptor>> _registry = new();
-        private readonly Dictionary<Type, object> _singletons = new();
-        private readonly Dictionary<Type, object> _scoped = new();
-
-        // ── Disposal tracking ───────────────────────────────────────────
-        private readonly List<IDisposable> _disposables = new();
+        // Allocated on first use: a scope that only resolves costs a single object.
+        private Dictionary<Type, List<ServiceDescriptor>> _registry;
+        private Dictionary<ServiceDescriptor, object> _instances;
+        private List<object> _disposables;
+        private HashSet<object> _tracked;
         private bool _disposed;
 
-        // ── Cycle detection: shared HashSet across parent/child chain ───
-        // A dependency cycle can span scopes (e.g. a global singleton needing a
-        // scene-scoped service that in turn needs the singleton back). The whole
-        // parent/child chain shares one set via Root, so cross-scope cycles are
-        // detected instead of recursing until stack overflow.
-        private DiContainer Root => _parent?.Root ?? this;
-        private readonly HashSet<Type> _resolvingLocal = new();
-        private readonly HashSet<Type> _constructingLocal = new();
-        private HashSet<Type> Resolving => Root._resolvingLocal;
-        private HashSet<Type> Constructing => Root._constructingLocal;
-
-        private static int s_mainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
-
-#if UNITY_2019_1_OR_NEWER
-        // Re-capture on every domain/scene load: static initializers run on
-        // whichever thread first touches the type (test host, background
-        // loader), which would invert IsMainThread and all AssertMainThread
-        // guards. SubsystemRegistration runs on the main thread.
-        [UnityEngine.RuntimeInitializeOnLoadMethod(UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
-        private static void RecaptureMainThreadId() =>
-            s_mainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
-#endif
-
-        /// <summary>True on the Unity main thread. The container is intentionally
-        /// single-threaded (plain Dictionaries, shared Resolve/Construct sets);
-        /// background-thread resolve is unsupported by design.</summary>
-        public static bool IsMainThread => System.Threading.Thread.CurrentThread.ManagedThreadId == s_mainThreadId;
-
-        // ── Construction ────────────────────────────────────────────────
-
-        public DiContainer(DiContainer parent = null)
+        /// <summary>
+        /// Creates a root container, or a scope when <paramref name="parent"/> is given
+        /// (prefer <see cref="CreateScope"/>). <paramref name="options"/> is copied; scopes inherit
+        /// their parent's options unless they pass their own.
+        /// </summary>
+        public DiContainer(DiContainer parent = null, DiContainerOptions options = null)
         {
+            MainThread.Assert(nameof(DiContainer));
+
+            if (parent != null)
+            {
+                parent.ThrowIfDisposed();
+                _state = parent._state;
+                _options = options != null ? options.Clone() : parent._options;
+            }
+            else
+            {
+                _state = new ResolutionState();
+                _options = (options ?? new DiContainerOptions()).Clone();
+            }
+
             _parent = parent;
         }
 
         /// <summary>
-        /// Factory method that ensures the container is created on the main Unity thread.
+        /// Creates a container and, unlike a plain constructor call, enforces the main-thread
+        /// contract in every build (not only in the Editor and development builds).
         /// </summary>
-        public static DiContainer CreateOnMainThread(DiContainer parent = null)
+        public static DiContainer CreateOnMainThread(DiContainer parent = null, DiContainerOptions options = null)
         {
-            if (System.Threading.Thread.CurrentThread.ManagedThreadId != s_mainThreadId)
-                throw new InvalidOperationException(
-                    "[DiContainer] CreateOnMainThread() must be called from the main thread.");
-            return new DiContainer(parent);
+            MainThread.Require("CreateOnMainThread()");
+            return new DiContainer(parent, options);
         }
+
+        /// <summary>True on the Unity main thread.</summary>
+        public static bool IsMainThread => MainThread.IsMain;
+
+        /// <summary>True once <see cref="Dispose"/> or <see cref="DisposeAsync"/> has been called.</summary>
+        public bool IsDisposed => _disposed;
+
+        /// <summary>Number of <c>TryResolve</c> misses seen by this container chain (diagnostics and tests).</summary>
+        internal int TryResolveMissCount => _state.MissCount;
+
+        /// <summary>Readable name for a type, generics included (<c>Func&lt;IFoo&gt;</c>, not <c>Func`1</c>).</summary>
+        internal static string PrettyName(Type type)
+        {
+            if (type == null) return "null";
+            if (type.IsArray) return PrettyName(type.GetElementType()) + "[]";
+            if (!type.IsGenericType) return type.Name;
+
+            var name = type.Name;
+            int tick = name.IndexOf('`');
+            if (tick > 0) name = name.Substring(0, tick);
+
+            var arguments = type.GetGenericArguments();
+            var sb = new StringBuilder(name).Append('<');
+            for (int i = 0; i < arguments.Length; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(PrettyName(arguments[i]));
+            }
+            return sb.Append('>').ToString();
+        }
+
+        /// <summary>A destroyed UnityEngine.Object compares equal to null; plain objects never do.</summary>
+        private static bool IsDestroyedUnityObject(object instance)
+            => instance is UnityEngine.Object unityObject && unityObject == null;
     }
 }

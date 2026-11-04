@@ -5,6 +5,7 @@
 [Ll]ibrary/
 [Tt]emp/
 [Oo]bj/
+[Bb]in/
 [Bb]uild/
 [Bb]uilds/
 [Ll]ogs/
@@ -28,6 +29,12 @@
 *.user
 *.userprefs
 *.suo
+
+# The verification rig is a checked-in .NET project, not a generated Unity file.
+!Tools~/rig/rig.csproj
+
+# GameCI staging directory.
+.ci/
 
 # IDE
 .vs/

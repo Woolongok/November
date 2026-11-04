@@ -1,288 +1,265 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
-using System.Linq.Expressions;
 using UnityEngine;
 
 namespace November.DI
 {
-
     /// <summary>
-    /// DiContainer resolution partition: Resolve / TryResolve / ResolveAll /
-    /// descriptor dispatch with cycle detection.
-    /// Same type via partial — no behaviour change.
+    /// Resolution partition: Resolve / TryResolve / ResolveAll, registry lookup and lifetime dispatch.
     /// </summary>
-    public sealed partial class DiContainer : IDiScope, IServiceProvider, IScopeFactory
+    public sealed partial class DiContainer
     {
-        // Cache for compiled List<T> factory per element type — zero-reflection per call.
-        private static readonly Dictionary<Type, Func<System.Collections.IList>> _listFactoryCache = new();
-        private static readonly object _listFactoryLock = new();
-
         public TService Resolve<TService>() => (TService)Resolve(typeof(TService));
 
         public object Resolve(Type type)
         {
             if (type == null) throw new ArgumentNullException(nameof(type));
             ThrowIfDisposed();
-            AssertMainThread($"Resolve({type.Name})");
-
-            // Handle Func<T> and Lazy<T> open generics
-            if (type.IsGenericType)
-            {
-                var def = type.GetGenericTypeDefinition();
-
-                if (def == typeof(Func<>))
-                {
-                    var returnType = type.GetGenericArguments()[0];
-                    return CreateTypedFactory(returnType, () => Resolve(returnType));
-                }
-
-                if (def == typeof(Lazy<>))
-                    return CreateTypedLazy(type.GetGenericArguments()[0]);
-            }
-
-            if (!Resolving.Add(type))
-                throw new InvalidOperationException(
-                    $"Circular dependency detected while resolving '{type.FullName}'. " +
-                    $"Chain: {string.Join(" -> ", Resolving.Select(t => t.Name))} -> {type.Name}. " +
-                    "Use Lazy<T> or Func<T> to break the cycle.");
-
-            try { return ResolveCore(type); }
-            finally { Resolving.Remove(type); }
+            MainThread.Assert(type);
+            return ResolveInternal(type);
         }
-
-        // Warn-once bookkeeping: TryResolve is the optional-service probe, so a
-        // miss can be legitimate (and a caller may probe in a loop) — logging on
-        // every call would spam the console. Static for app lifetime; tests can
-        // reset via ClearResolveFailureHistory so a first-test mis-wire does not
-        // silence later tests.
-        private static readonly HashSet<Type> _resolveFailureWarned = new HashSet<Type>();
-        private static readonly object _resolveFailureLock = new();
-
-        /// <summary>Test hook: re-arm TryResolve warnings (static warn-once set).</summary>
-        public static void ClearResolveFailureHistory() { lock (_resolveFailureLock) { _resolveFailureWarned.Clear(); } }
-
-        /// <summary>Total TryResolve misses (warn-once still applies to the log, but
-        /// the count keeps every mis-wire observable instead of silent after first).</summary>
-        public static int ResolveFailureCount => _resolveFailureCount;
-        private static int _resolveFailureCount;
 
         public bool TryResolve<TService>(out TService result)
         {
-            try
+            ThrowIfDisposed();
+            var type = typeof(TService);
+            MainThread.Assert(type);
+
+            // false means exactly one thing: nothing is registered. Everything else (disposed container,
+            // wrong thread, a throwing constructor or factory, a dependency cycle) propagates untouched.
+            if (!CanResolve(type))
             {
-                result = Resolve<TService>();
-                return true;
-            }
-            catch (InvalidOperationException ex)
-            {
-                // Fail-loud for real construction bugs: only a missing
-                // registration is an optional-miss. If a registration exists
-                // but resolution threw (circular dep, singleton ctor failure,
-                // factory exception), rethrow so the mis-wire surfaces instead
-                // of reading as "optional miss" with default(null).
-                if (HasRegistration(typeof(TService)))
-                    throw;
-                System.Threading.Interlocked.Increment(ref _resolveFailureCount);
-                bool first;
-                lock (_resolveFailureLock) { first = _resolveFailureWarned.Add(typeof(TService)); }
-                if (first)
-                    Debug.LogWarning($"[DiContainer] TryResolve<{typeof(TService).Name}> failed:\n{ex}");
-                else
-                    Debug.Log($"[DiContainer] TryResolve<{typeof(TService).Name}> missed again (total {ResolveFailureCount}).");
+                RecordMiss(type);
                 result = default;
                 return false;
             }
+
+            result = (TService)ResolveInternal(type);
+            return true;
         }
 
         public IEnumerable<TService> ResolveAll<TService>(bool includeParents = true)
-            => ResolveAll(typeof(TService), includeParents).Cast<TService>();
+        {
+            ThrowIfDisposed();
+            MainThread.Assert(typeof(TService));
+            return (TService[])ResolveAllCore(typeof(TService), includeParents);
+        }
 
         public bool HasRegistration(Type type)
         {
-            if (_registry.ContainsKey(type)) return true;
-            return _parent != null && _parent.HasRegistration(type);
+            ThrowIfDisposed();
+            MainThread.Assert(nameof(HasRegistration));
+            if (type == null) throw new ArgumentNullException(nameof(type));
+            return CanResolve(type);
         }
 
-        private IEnumerable ResolveAll(Type elementType, bool includeParents)
+        private void RecordMiss(Type type)
         {
-            Func<System.Collections.IList> factory;
-            lock (_listFactoryLock)
+            _state.MissCount++;
+            if (_options.WarnOnTryResolveMiss && _state.FirstMiss(type))
+                Debug.LogWarning(
+                    $"[DiContainer] TryResolve<{PrettyName(type)}> found no registration and returned false. " +
+                    "Logged once per type; use HasRegistration to probe silently, or fix the wiring if it is required.");
+        }
+
+        // ── Lookup ──────────────────────────────────────────────────────────
+
+        /// <summary>Nearest registration for the type, own scope first; the last binding in a scope wins.</summary>
+        private bool FindDescriptor(Type type, out ServiceDescriptor descriptor, out DiContainer owner)
+        {
+            for (var scope = this; scope != null; scope = scope._parent)
             {
-                if (!_listFactoryCache.TryGetValue(elementType, out factory))
+                if (scope._registry != null && scope._registry.TryGetValue(type, out var list) && list.Count > 0)
                 {
-                    var listType = typeof(List<>).MakeGenericType(elementType);
-                    var ctor = listType.GetConstructor(Type.EmptyTypes);
-                    // Expression.Compile avoids ctor.Invoke reflection overhead entirely.
-                    var lambda = Expression.Lambda<Func<System.Collections.IList>>(
-                        Expression.New(ctor));
-                    factory = lambda.Compile();
-                    _listFactoryCache[elementType] = factory;
+                    descriptor = list[list.Count - 1];
+                    owner = scope;
+                    return true;
                 }
             }
 
-            var resultList = factory();
-
-            if (includeParents && _parent != null)
-                foreach (var item in _parent.ResolveAll(elementType, includeParents: true))
-                    resultList.Add(item);
-
-            if (_registry.TryGetValue(elementType, out var descriptors))
-            {
-                foreach (var d in descriptors)
-                    resultList.Add(ResolveDescriptor(elementType, d));
-            }
-
-            return resultList;
+            descriptor = null;
+            owner = null;
+            return false;
         }
 
-        private object ResolveCore(Type type)
+        private static bool IsCollectionDefinition(Type definition)
+            => definition == typeof(IEnumerable<>) || definition == typeof(IReadOnlyList<>) ||
+               definition == typeof(IReadOnlyCollection<>) || definition == typeof(IList<>) ||
+               definition == typeof(ICollection<>);
+
+        /// <summary>Registered, or an implicit wrapper over something that is.</summary>
+        private bool CanResolve(Type type)
         {
-            // IEnumerable<T> → resolve all
-            if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(IEnumerable<>))
-                return ResolveAll(type.GetGenericArguments()[0], includeParents: true);
+            if (FindDescriptor(type, out _, out _)) return true;
 
-            // Direct registration lookup (last registered wins for single-resolve)
-            if (_registry.TryGetValue(type, out var descriptors) && descriptors.Count > 0)
-                return ResolveDescriptor(type, descriptors[^1]);
+            if (type.IsArray)
+                return type.GetArrayRank() == 1 && !type.GetElementType().IsValueType;
 
-            // Parent delegation with cycle-detection safety.
-            // Scoped is the exception: the descriptor may live on an ancestor,
-            // but the instance is created, cached and tracked HERE, so sibling
-            // scopes stay independent and parent disposal does not cascade into
-            // them. Singleton/Transient keep delegating (shared / caller-owned).
-            if (_parent != null && _parent.HasRegistration(type))
+            if (!type.IsGenericType) return false;
+
+            var definition = type.GetGenericTypeDefinition();
+            var argument = type.GetGenericArguments()[0];
+            if (definition == typeof(Func<>) || definition == typeof(Lazy<>)) return CanResolve(argument);
+            return IsCollectionDefinition(definition) && !argument.IsValueType;
+        }
+
+        // ── Dispatch ────────────────────────────────────────────────────────
+
+        private object ResolveInternal(Type type)
+        {
+            if (FindDescriptor(type, out var descriptor, out var owner))
+                return ResolveDescriptor(descriptor, owner);
+            return ResolveImplicit(type);
+        }
+
+        /// <summary>Func&lt;T&gt;, Lazy&lt;T&gt;, IEnumerable&lt;T&gt;-style collections and T[] when no registration matched.</summary>
+        private object ResolveImplicit(Type type)
+        {
+            if (type.IsArray)
             {
-                var ancestorDescriptor = _parent.FindNearestDescriptor(type);
-                if (ancestorDescriptor != null && ancestorDescriptor.Lifetime == Lifetime.Scoped)
-                    return ResolveDescriptor(type, ancestorDescriptor);
-                return ResolveFromParent(type);
+                var element = type.GetElementType();
+                if (type.GetArrayRank() == 1 && !element.IsValueType)
+                    return ResolveAllCore(element, includeParents: true);
+            }
+            else if (type.IsGenericType)
+            {
+                var definition = type.GetGenericTypeDefinition();
+                var argument = type.GetGenericArguments()[0];
+
+                if (definition == typeof(Func<>)) { RequireRegistered(argument, type); return CreateFunc(argument); }
+                if (definition == typeof(Lazy<>)) { RequireRegistered(argument, type); return CreateLazy(argument); }
+                if (IsCollectionDefinition(definition) && !argument.IsValueType)
+                    return ResolveAllCore(argument, includeParents: true);
             }
 
-            // No registration found — fail fast instead of silently auto-creating.
-            if (!type.IsAbstract && !type.IsInterface)
-            {
-                if (_parent != null)
-                    return ResolveFromParent(type);
+            throw NotRegistered(type);
+        }
 
+        private void RequireRegistered(Type argument, Type wrapper)
+        {
+            if (!CanResolve(argument)) throw NotRegistered(argument, wrapper);
+        }
+
+        /// <summary>
+        /// Runs on the RESOLVING scope (<c>this</c>); <paramref name="owner"/> is the scope that holds the
+        /// registration. Only singletons are built by the owner.
+        /// </summary>
+        private object ResolveDescriptor(ServiceDescriptor descriptor, DiContainer owner)
+        {
+            switch (descriptor.Kind)
+            {
+                case DescriptorKind.Instance: return GetRegisteredInstance(descriptor);
+                case DescriptorKind.Alias: return ResolveAlias(descriptor);
+            }
+
+            if (descriptor.Lifetime == Lifetime.Singleton)
+            {
+                if (owner._disposed) throw OwnerDisposed(descriptor);
+                return owner.GetOrCreateCached(descriptor);
+            }
+
+            if (descriptor.Lifetime == Lifetime.Scoped)
+            {
+                if (_parent == null && _options.ValidateScopes) throw ScopedFromRoot(descriptor);
+                return GetOrCreateCached(descriptor);
+            }
+
+            return CreateTransient(descriptor);
+        }
+
+        /// <summary>Singleton cache of the owner, or scoped cache of the resolving scope; constructs on a miss.</summary>
+        private object GetOrCreateCached(ServiceDescriptor descriptor)
+        {
+            if (_instances != null && _instances.TryGetValue(descriptor, out var existing))
+            {
+                // Scene objects die with their scene: never hand out a destroyed Unity object.
+                if (!IsDestroyedUnityObject(existing)) return existing;
+                _instances.Remove(descriptor);
+            }
+
+            var instance = Construct(descriptor);
+
+            if (_instances == null) _instances = new Dictionary<ServiceDescriptor, object>();
+            _instances[descriptor] = instance;
+            MarkInjected(instance);
+            Track(instance);
+            return instance;
+        }
+
+        private object CreateTransient(ServiceDescriptor descriptor)
+        {
+            var instance = Construct(descriptor);
+
+            if (_parent == null && _options.WarnOnRootTransientDisposables)
+                WarnIfRootTransientDisposable(instance);
+
+            Track(instance);
+            return instance;
+        }
+
+        private object GetRegisteredInstance(ServiceDescriptor descriptor)
+        {
+            if (descriptor.IsDestroyedInstance)
                 throw new InvalidOperationException(
-                    $"No registration found for concrete type '{type.FullName}'. " +
-                    $"Register it via Register<TService, TImpl>(), RegisterInstance<T>(), or RegisterFactory<T>(). " +
-                    $"(Chain: {string.Join(" -> ", Resolving.Select(t => t.Name))})");
-            }
-
-            if (_parent != null)
-                return ResolveFromParent(type);
-
-            throw new InvalidOperationException(
-                $"No registration found for '{type.FullName}'. " +
-                $"Ensure it is registered before resolving. " +
-                $"(Chain: {string.Join(" -> ", Resolving.Select(t => t.Name))})");
+                    $"[DiContainer] Registered instance for '{descriptor.ServiceType.FullName}' was destroyed (scene unload?). " +
+                    "Register the live instance again (RegisterInstance replaces a destroyed one); the dead reference is never returned.");
+            return descriptor.Instance;
         }
 
-        private object ResolveFromParent(Type type)
+        /// <summary>Forwards to the target's resolution: same instance, no second injection or disposal.</summary>
+        private object ResolveAlias(ServiceDescriptor descriptor)
         {
-            Resolving.Remove(type);
-            try { return _parent.Resolve(type); }
-            finally { Resolving.Add(type); }
-        }
-
-        /// <summary>Nearest registration for <paramref name="type"/> up the scope
-        /// chain (own scope first). Used to honor Scoped lifetime locally even
-        /// when the descriptor lives on an ancestor.</summary>
-        private ServiceDescriptor FindNearestDescriptor(Type type)
-        {
-            if (_registry.TryGetValue(type, out var descriptors) && descriptors.Count > 0)
-                return descriptors[^1];
-            return _parent?.FindNearestDescriptor(type);
-        }
-
-        private object ResolveDescriptor(Type serviceType, ServiceDescriptor descriptor)
-        {
-            switch (descriptor.Lifetime)
+            int mark = EnterFrame(descriptor);
+            try
             {
-                case Lifetime.Singleton:
-                    {
-                        // Descriptor is always resolved from its owning container,
-                        // so `this` is the correct scope for singleton caching.
-                        if (_singletons.TryGetValue(serviceType, out var existing))
-                        {
-                            // Scene MonoBehaviours registered as instances die
-                            // with their scene: a destroyed Unity object must
-                            // never be handed out as a live singleton. External
-                            // instances cannot be recreated (factory returns the
-                            // same dead ref) — fail loud so the owner re-registers.
-                            if (existing is UnityEngine.Object unityObj && unityObj == null)
-                            {
-                                _singletons.Remove(serviceType);
-                                if (descriptor.IsExternalInstance)
-                                    throw new InvalidOperationException(
-                                        $"[DiContainer] Registered instance for '{serviceType.FullName}' was destroyed (scene unload?). Re-register the live instance — the dead reference is evicted, not returned.");
-                            }
-                            else return existing;
-                        }
-
-                        try
-                        {
-                            var instance = CreateAndTrack(
-                                descriptor.ImplementationType,
-                                descriptor.Factory,
-                                Lifetime.Singleton,
-                                descriptor.IsExternalInstance);
-
-                            _singletons[serviceType] = instance;
-                            return instance;
-                        }
-                        catch
-                        {
-                            _singletons.Remove(serviceType);
-                            Debug.LogError(
-                                $"[DiContainer] Singleton construction failed for {serviceType.FullName}. Cache cleared.");
-                            throw;
-                        }
-                    }
-
-                case Lifetime.Scoped:
-                    {
-                        if (_scoped.TryGetValue(serviceType, out var existing))
-                        {
-                            if (existing is UnityEngine.Object unityObj && unityObj == null)
-                            {
-                                _scoped.Remove(serviceType);
-                                if (descriptor.IsExternalInstance)
-                                    throw new InvalidOperationException(
-                                        $"[DiContainer] Registered scoped instance for '{serviceType.FullName}' was destroyed. Re-register the live instance.");
-                            }
-                            else return existing;
-                        }
-
-                        try
-                        {
-                            var instance = CreateAndTrack(
-                                descriptor.ImplementationType,
-                                descriptor.Factory,
-                                Lifetime.Scoped,
-                                descriptor.IsExternalInstance);
-
-                            _scoped[serviceType] = instance;
-                            return instance;
-                        }
-                        catch
-                        {
-                            _scoped.Remove(serviceType);
-                            throw;
-                        }
-                    }
-
-                default: // Transient
-                    return CreateAndTrack(
-                        descriptor.ImplementationType,
-                        descriptor.Factory,
-                        Lifetime.Transient,
-                        externalInstance: false);
+                var result = ResolveInternal(descriptor.ImplementationType);
+                if (!descriptor.ServiceType.IsInstanceOfType(result))
+                    throw new InvalidOperationException(
+                        $"[DiContainer] Alias '{PrettyName(descriptor.ServiceType)}' -> '{PrettyName(descriptor.ImplementationType)}' " +
+                        $"resolved to a '{result.GetType().Name}', which is not a '{PrettyName(descriptor.ServiceType)}'.");
+                return result;
             }
+            catch (Exception ex)
+            {
+                Annotate(ex);
+                throw;
+            }
+            finally
+            {
+                LeaveFrame(mark);
+            }
+        }
+
+        // ── Collections ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Every binding of <paramref name="elementType"/>, ancestors first, built by THIS scope — so scoped and
+        /// transient entries are exactly what <c>Resolve</c> would have produced. Returns a typed array, which
+        /// satisfies IEnumerable&lt;T&gt;, IReadOnlyList&lt;T&gt; and T[] without any generic instantiation.
+        /// </summary>
+        private Array ResolveAllCore(Type elementType, bool includeParents)
+        {
+            int count = 0;
+            for (var scope = this; scope != null; scope = includeParents ? scope._parent : null)
+                if (scope._registry != null && scope._registry.TryGetValue(elementType, out var bindings))
+                    count += bindings.Count;
+
+            var result = Array.CreateInstance(elementType, count);
+            if (count == 0) return result;
+
+            int index = 0;
+            CollectInto(this, elementType, includeParents, result, ref index);
+            return result;
+        }
+
+        private void CollectInto(DiContainer resolver, Type elementType, bool includeParents, Array target, ref int index)
+        {
+            if (includeParents && _parent != null)
+                _parent.CollectInto(resolver, elementType, true, target, ref index);
+
+            if (_registry == null || !_registry.TryGetValue(elementType, out var bindings)) return;
+            for (int i = 0; i < bindings.Count; i++)
+                target.SetValue(resolver.ResolveDescriptor(bindings[i], this), index++);
         }
     }
-
 }

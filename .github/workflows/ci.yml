@@ -1,0 +1,181 @@
+# This workflow was added but has not yet been run. Configure the Unity secrets before use.
+name: Unity package CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_il2cpp:
+        description: Build an optional Linux IL2CPP player
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: ${{ matrix.testMode }} tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        testMode:
+          - editmode
+          - playmode
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # GameCI package mode hangs when the package is the repository root. Stage a copy
+      # in a subdirectory and point the test runner at that copy.
+      - name: Stage the package for GameCI
+        shell: bash
+        run: |
+          mkdir -p .ci/package
+          git archive HEAD | tar -x -C .ci/package
+
+      - name: Run Unity package tests
+        uses: game-ci/unity-test-runner@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: .ci/package
+          unityVersion: 6000.0.85f1
+          testMode: ${{ matrix.testMode }}
+          packageMode: true
+          artifactsPath: artifacts/${{ matrix.testMode }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.testMode }}-test-results
+          path: artifacts/${{ matrix.testMode }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+  il2cpp:
+    name: Optional Linux IL2CPP player build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_il2cpp }}
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create a minimal Unity project that references this package
+        shell: bash
+        run: |
+          project=".ci/Il2CppProject"
+          mkdir -p "$project/Assets/Editor" "$project/Packages/com.woolongok.november" "$project/ProjectSettings"
+          git archive HEAD | tar -x -C "$project/Packages/com.woolongok.november"
+          cat > "$project/ProjectSettings/ProjectVersion.txt" <<'EOF'
+          m_EditorVersion: 6000.0.85f1
+          EOF
+          cat > "$project/Packages/manifest.json" <<'EOF'
+          {
+            "dependencies": {}
+          }
+          EOF
+          cat > "$project/Assets/NovemberIl2CppSmoke.cs" <<'EOF'
+          using System;
+          using November.DI;
+          using UnityEngine;
+          using UnityEngine.Scripting;
+
+          public sealed class NovemberIl2CppSmoke : MonoBehaviour
+          {
+              private void Awake()
+              {
+                  using (var container = new DiContainer())
+                  {
+                      container.Register<NovemberIl2CppService>(Lifetime.Singleton);
+                      Func<NovemberIl2CppService> factory = container.Resolve<Func<NovemberIl2CppService>>();
+                      Lazy<NovemberIl2CppService> lazy = container.Resolve<Lazy<NovemberIl2CppService>>();
+                      if (factory() == null || lazy.Value == null)
+                          throw new InvalidOperationException("November DI IL2CPP smoke test failed.");
+                  }
+              }
+          }
+
+          [Preserve]
+          public sealed class NovemberIl2CppService
+          {
+              public NovemberIl2CppService() { }
+          }
+          EOF
+          cat > "$project/Assets/Editor/NovemberIl2CppBuild.cs" <<'EOF'
+          using System;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          namespace November.CI
+          {
+              public static class Il2CppBuild
+              {
+                  public static void Build()
+                  {
+                      const string scenePath = "Assets/NovemberIl2CppSmoke.unity";
+                      Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                      GameObject root = new GameObject("NovemberIl2CppSmoke");
+                      root.AddComponent<NovemberIl2CppSmoke>();
+                      EditorSceneManager.SaveScene(scene, scenePath);
+                      EditorBuildSettings.scenes = new[]
+                      {
+                          new EditorBuildSettingsScene(scenePath, true)
+                      };
+
+                      PlayerSettings.SetScriptingBackend(
+                          BuildTargetGroup.Standalone,
+                          ScriptingImplementation.IL2CPP);
+                      PlayerSettings.SetManagedStrippingLevel(
+                          BuildTargetGroup.Standalone,
+                          ManagedStrippingLevel.High);
+
+                      BuildReport report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                      {
+                          scenes = new[] { scenePath },
+                          locationPathName = "Build/NovemberIl2CppSmoke.x86_64",
+                          target = BuildTarget.StandaloneLinux64,
+                          options = BuildOptions.None
+                      });
+
+                      if (report.summary.result != BuildResult.Succeeded)
+                          throw new Exception("Linux IL2CPP build failed: " + report.summary.result);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Linux IL2CPP player
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: .ci/Il2CppProject
+          unityVersion: 6000.0.85f1
+          targetPlatform: StandaloneLinux64
+          buildMethod: November.CI.Il2CppBuild.Build
+          buildsPath: artifacts/il2cpp
+          allowDirtyBuild: true
+
+      - name: Upload IL2CPP player
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-il2cpp-player
+          path: artifacts/il2cpp
+          if-no-files-found: ignore
+          retention-days: 14

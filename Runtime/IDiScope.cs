@@ -2,27 +2,20 @@ using System;
 
 namespace November.DI
 {
-
     /// <summary>
-    /// A self-contained DI scope that supports registration, resolution, and injection.
-    /// Created by IScopeFactory.CreateScope().
+    /// A self-contained DI scope: registration, resolution, injection, child scopes and
+    /// disposal. Created by <see cref="IScopeFactory.CreateScope"/>.
     ///
-    /// A scope inherits parent registrations and can define its own. Disposing the scope
-    /// releases all scoped and singleton instances created within it.
+    /// A scope inherits parent registrations and can define its own. Disposing it releases
+    /// everything it created and tracked: its singletons, its scoped services and the
+    /// transient disposables that were resolved through it.
     ///
-    /// ═══ Scope Lifecycle ═══════════════════════════════════════════
-    /// - Dispose() releases only this scope's resources (its scoped and singleton instances).
-    /// - Parent containers do NOT track child scopes. Disposing a parent does NOT cascade
-    ///   disposal to its children. Each scope must be disposed independently.
-    /// - After disposal, the scope's IServiceResolver and IInjector throw ObjectDisposedException.
-    /// ════════════════════════════════════════════════════════════════
-    ///
-    /// SOLID: follows Interface Segregation by composing smaller interfaces:
-    ///   IServiceRegistry — register services within this scope
-    ///   IServiceProvider  — resolve services and inject dependencies
-    ///   IDisposable       — clean up scope resources
+    /// - Dispose() / DisposeAsync() releases only this scope's resources.
+    /// - Parents do not track child scopes; each scope must be disposed independently.
+    /// - After disposal every resolve, inject, register and CreateScope call throws
+    ///   <see cref="ObjectDisposedException"/>.
     /// </summary>
-    public interface IDiScope : IServiceRegistry, IServiceProvider, IDisposable
+    public interface IDiScope : IServiceRegistry, IDiProvider, IScopeFactory, IDisposable, IAsyncDisposable
     {
     }
 }

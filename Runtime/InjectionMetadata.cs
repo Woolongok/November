@@ -1,330 +1,252 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
+using UnityEngine;
 
 namespace November.DI
 {
-
     /// <summary>
-    /// Public cross-assembly query over the internal <see cref="InjectionMetadata"/>
-    /// cache. Scene contexts (Game.Gameplay assembly) use this to skip
-    /// non-participating MonoBehaviours during scene-wide injection; the cache
-    /// itself stays internal so reflection internals never leak across assemblies.
+    /// Public cross-assembly query over the internal injection metadata. Scene contexts in other
+    /// assemblies use it to skip MonoBehaviours that have no injection points; the metadata types
+    /// themselves stay internal so reflection details never leak across assemblies.
     /// </summary>
     public static class InjectionQuery
     {
-        /// <summary>O(1) check whether a type needs any injection — see
-        /// <see cref="InjectionMetadata.TypeNeedsAnyInjection"/>.</summary>
-        public static bool TypeNeedsAnyInjection(Type type) =>
-            InjectionMetadata.TypeNeedsAnyInjection(type);
+        /// <summary>True when the type has any [Inject] field/method or [Resolve] field. O(1) after the first call per type.</summary>
+        public static bool TypeNeedsAnyInjection(Type type)
+        {
+            MainThread.Assert(nameof(TypeNeedsAnyInjection));
+            if (type == null) throw new ArgumentNullException(nameof(type));
+            return InjectionMetadata.GetPlan(type).NeedsAnyInjection;
+        }
+    }
+
+    internal readonly struct InjectMethodPlan
+    {
+        public readonly MethodInfo Method;
+        public readonly ParameterInfo[] Parameters;
+
+        public InjectMethodPlan(MethodInfo method, ParameterInfo[] parameters)
+        {
+            Method = method;
+            Parameters = parameters;
+        }
+    }
+
+    internal readonly struct ResolveFieldPlan
+    {
+        public readonly FieldInfo Field;
+        public readonly ComponentSource Source;
+        public readonly bool Optional;
+
+        public ResolveFieldPlan(FieldInfo field, ComponentSource source, bool optional)
+        {
+            Field = field;
+            Source = source;
+            Optional = optional;
+        }
     }
 
     /// <summary>
-    /// Pre-computed metadata cache for injection points across all loaded types.
-    /// Populated at static initialization time to eliminate per-scene reflection overhead.
+    /// Everything the container needs to construct and inject one type, computed once by reflection
+    /// and then reused: the constructor and its parameters, [Inject] fields and methods (with their
+    /// parameter arrays) and [Resolve] fields. Immutable after construction.
+    /// </summary>
+    internal sealed class TypePlan
+    {
+        public readonly Type Type;
+        public readonly FieldInfo[] InjectFields;
+        public readonly InjectMethodPlan[] InjectMethods;
+        public readonly ResolveFieldPlan[] ResolveFields;
+        public readonly bool NeedsContainerInjection;
+        public readonly bool NeedsComponentResolution;
+        public readonly bool NeedsAnyInjection;
+
+        // Constructor selection is lazy and published as one immutable object: most injection targets
+        // (MonoBehaviours) are never constructed by the container, and a type with an ambiguous
+        // constructor must only fail when somebody actually tries to construct it.
+        private sealed class ConstructorChoice
+        {
+            public readonly ConstructorInfo Constructor;
+            public readonly ParameterInfo[] Parameters;
+            public readonly string Error;
+
+            public ConstructorChoice(ConstructorInfo constructor, ParameterInfo[] parameters, string error)
+            {
+                Constructor = constructor;
+                Parameters = parameters;
+                Error = error;
+            }
+        }
+
+        private ConstructorChoice _choice;
+
+        public TypePlan(Type type, FieldInfo[] injectFields, InjectMethodPlan[] injectMethods, ResolveFieldPlan[] resolveFields)
+        {
+            Type = type;
+            InjectFields = injectFields;
+            InjectMethods = injectMethods;
+            ResolveFields = resolveFields;
+            NeedsContainerInjection = injectFields.Length > 0 || injectMethods.Length > 0;
+            NeedsComponentResolution = resolveFields.Length > 0;
+            NeedsAnyInjection = NeedsContainerInjection || NeedsComponentResolution;
+        }
+
+        /// <summary>The constructor to call. Throws <see cref="InvalidOperationException"/> when none, or more than one, is eligible.</summary>
+        public ConstructorInfo Constructor => Choice().Constructor;
+
+        /// <summary>Parameters of <see cref="Constructor"/>; the array is shared, do not modify it.</summary>
+        public ParameterInfo[] ConstructorParameters => Choice().Parameters;
+
+        private ConstructorChoice Choice()
+        {
+            var choice = _choice ?? (_choice = SelectConstructor(Type));
+            if (choice.Error != null) throw new InvalidOperationException(choice.Error);
+            return choice;
+        }
+
+        private static ConstructorChoice SelectConstructor(Type type)
+        {
+            var all = type.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            ConstructorInfo marked = null, onlyPublic = null;
+            int markedCount = 0, publicCount = 0;
+            foreach (var ctor in all)
+            {
+                if (ctor.IsDefined(typeof(InjectAttribute), false)) { markedCount++; if (marked == null) marked = ctor; }
+                if (ctor.IsPublic) { publicCount++; if (onlyPublic == null) onlyPublic = ctor; }
+            }
+
+            if (markedCount > 1)
+                return Fail($"Type '{type.FullName}' has {markedCount} constructors marked [Inject]. Mark exactly one.");
+
+            var chosen = markedCount == 1 ? marked : (publicCount == 1 ? onlyPublic : null);
+            if (chosen != null)
+                return new ConstructorChoice(chosen, chosen.GetParameters(), null);
+
+            return Fail(publicCount > 1
+                ? $"Type '{type.FullName}' has {publicCount} public constructors. Annotate the intended one with [Inject] to remove ambiguity."
+                : $"Type '{type.FullName}' has no accessible constructors. Add a public constructor or annotate one with [Inject].");
+        }
+
+        private static ConstructorChoice Fail(string message) => new ConstructorChoice(null, null, message);
+    }
+
+    /// <summary>
+    /// Lazily built, per-type injection plans. Nothing is scanned at startup: a type is inspected the
+    /// first time it is constructed or injected, and its hierarchy walk stops at engine and framework
+    /// base types (they cannot carry our attributes).
     ///
-    /// Efficiency: instead of scanning every MonoBehaviour's fields/methods at scene load
-    /// (the O(n*m) problem), we discover injection points once per type at class init
-    /// and only iterate MonoBehaviours that actually HAVE injection points.
-    ///
-    /// SOLID: Single Responsibility — this class handles ONLY injection metadata caching.
+    /// Threading: plans are cached in a regular dictionary. Like the container, metadata queries
+    /// and cache resets must run on the Unity main thread.
     /// </summary>
     internal static class InjectionMetadata
     {
-        private static readonly ConcurrentDictionary<Type, FieldInfo[]> _injectFields = new();
-        private static readonly ConcurrentDictionary<Type, MethodInfo[]> _injectMethods = new();
-        private static readonly ConcurrentDictionary<Type, bool> _hasInjectPoint = new();
-        private static readonly ConcurrentDictionary<Type, FieldInfo[]> _resolveFields = new();
-        private static readonly ConcurrentDictionary<Type, bool> _hasResolvePoint = new();
-        private static readonly ConcurrentDictionary<Type, ConstructorInfo> _constructorCache = new();
-        private static readonly ConcurrentDictionary<Type, Type[]> _constructorParamCache = new();
-        private static readonly ConcurrentDictionary<Type, Func<object[], object>> _constructorDelegateCache = new();
+        private const BindingFlags DeclaredMembers =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
 
-        /// Global set of types that need DI container injection ([Inject] fields/methods).
-        /// Pre-computed so scene scanning can skip non-participating types instantly.
-        /// Guarded by lock (HashSet is not thread-safe; GetOrAdd delegates may run
-        /// concurrently during background priming).
-        /// </summary>
-        private static readonly HashSet<Type> _typesNeedingContainerInjection = new();
-        private static readonly object _injectionSetLock = new();
+        private static readonly Dictionary<Type, TypePlan> s_plans = new Dictionary<Type, TypePlan>();
 
-        /// <summary>
-        /// Global set of types that need component resolution ([Resolve] fields).
-        /// </summary>
-        private static readonly HashSet<Type> _typesNeedingComponentResolution = new();
+        public static TypePlan GetPlan(Type type)
+        {
+            if (s_plans.TryGetValue(type, out var plan)) return plan;
 
+            plan = Build(type);
+            s_plans.Add(type, plan);
+            return plan;
+        }
+
+        // Domain reload may be disabled ("Enter Play Mode Options"): start every play session clean.
 #if UNITY_EDITOR
         [UnityEditor.InitializeOnLoadMethod]
 #endif
-        [UnityEngine.RuntimeInitializeOnLoadMethod(UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
-        private static void Initialize()
-        {
-            // Domain reload may be disabled (Editor "Enter Play Mode Options") or the
-            // runtime may re-enter play mode with statics still populated from the
-            // previous session — start from a clean slate so no stale metadata (or
-            // stale "needs injection" flags) leaks in.
-            ClearCache();
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetStatics() => ClearCache();
 
-            // Pre-populate caches by scanning only assemblies that can actually
-            // carry our DI attributes: the assembly that defines [Inject]/[Resolve]
-            // plus every assembly referencing it (game, editor, tests). Unity
-            // packages, plugin and framework assemblies are skipped entirely —
-            // GetTypes() over them costs startup time with zero possible injection
-            // points (they cannot reference our attribute).
-            var diAssembly = typeof(InjectAttribute).Assembly;
-            string diAssemblyName = diAssembly.GetName().Name;
-
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if (assembly.IsDynamic) continue;
-                if (!CanUseDiAttributes(assembly, diAssembly, diAssemblyName)) continue;
-
-                Type[] types;
-                // GetTypes (not GetExportedTypes): exported types are PUBLIC only —
-                // internal/nested MonoBehaviours with [Inject] must be primed too,
-                // otherwise the scene scanners below silently skip them.
-                try { types = assembly.GetTypes(); }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    // Partially-loadable assembly: keep the types that did load so a
-                    // single broken type cannot disable DI for the whole assembly.
-                    // Logged once per assembly; TypeNeedsAnyInjection lazily primes
-                    // any type the startup scan missed.
-                    UnityEngine.Debug.LogWarning($"[InjectionMetadata] '{assembly.GetName().Name}' partially loadable: {ex.Types?.Length ?? 0} entries, {ex.LoaderExceptions?.Length ?? 0} loader errors. Continuing with loadable types.");
-                    types = Array.FindAll(ex.Types, t => t != null);
-                }
-                catch (Exception ex)
-                {
-                    UnityEngine.Debug.LogWarning($"[InjectionMetadata] Skipping assembly '{assembly.GetName().Name}': {ex.GetType().Name}: {ex}");
-                    continue;
-                }
-
-                foreach (var type in types)
-                {
-                    if (type.IsAbstract || type.IsInterface) continue;
-                    PrimeInjectionCache(type);
-                }
-            }
-        }
-
-        private static bool CanUseDiAttributes(Assembly assembly, Assembly diAssembly, string diAssemblyName)
-        {
-            if (assembly == diAssembly) return true;
-
-            AssemblyName[] referenced = assembly.GetReferencedAssemblies();
-            for (int i = 0; i < referenced.Length; i++)
-                if (referenced[i].Name == diAssemblyName)
-                    return true;
-
-            return false;
-        }
-
-        /// Pre-computes and caches injection metadata for a given type.
-        /// Thread-safe: ConcurrentDictionaries for metadata, locked HashSets
-        /// for the type sets (GetOrAdd delegates may run concurrently).
-        /// </summary>
-        public static void PrimeInjectionCache(Type type)
-        {
-            // ── [Inject] fields and methods ──────────────────────────────
-            _hasInjectPoint.GetOrAdd(type, t =>
-            {
-                var fields = new List<FieldInfo>();
-                var methods = new List<MethodInfo>();
-                var hierarchy = new Stack<Type>();
-
-                for (var current = t; current != null && current != typeof(object); current = current.BaseType)
-                    hierarchy.Push(current);
-
-                while (hierarchy.Count > 0)
-                {
-                    var current = hierarchy.Pop();
-                    var declaredFields = current.GetFields(
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-                    foreach (var f in declaredFields)
-                    {
-                        if (f.IsDefined(typeof(InjectAttribute), inherit: false))
-                            fields.Add(f);
-                    }
-
-                    var declaredMethods = current.GetMethods(
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-                    foreach (var m in declaredMethods)
-                    {
-                        if (m.IsDefined(typeof(InjectAttribute), inherit: false))
-                            methods.Add(m);
-                    }
-                }
-
-                _injectFields.TryAdd(t, fields.ToArray());
-                _injectMethods.TryAdd(t, methods.ToArray());
-
-                bool hasInject = fields.Count > 0 || methods.Count > 0;
-                if (hasInject) lock (_injectionSetLock) { _typesNeedingContainerInjection.Add(t); }
-                return hasInject;
-            });
-
-            // ── [Resolve] fields ─────────────────────────────────────────
-            _hasResolvePoint.GetOrAdd(type, t =>
-            {
-                var fields = new List<FieldInfo>();
-                var hierarchy = new Stack<Type>();
-
-                for (var current = t; current != null && current != typeof(object); current = current.BaseType)
-                    hierarchy.Push(current);
-
-                while (hierarchy.Count > 0)
-                {
-                    var current = hierarchy.Pop();
-                    var declaredFields = current.GetFields(
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-                    foreach (var f in declaredFields)
-                    {
-                        if (f.IsDefined(typeof(ResolveAttribute), inherit: false))
-                            fields.Add(f);
-                    }
-                }
-
-                _resolveFields.TryAdd(t, fields.ToArray());
-
-                bool hasResolve = fields.Count > 0;
-                if (hasResolve) lock (_injectionSetLock) { _typesNeedingComponentResolution.Add(t); }
-                return hasResolve;
-            });
-        }
-
-        // ── [Inject] accessors ──────────────────────────────────────────
-
-        public static bool TypeNeedsContainerInjection(Type type)
-        {
-            lock (_injectionSetLock) { if (_typesNeedingContainerInjection.Contains(type)) return true; }
-            // Fallback: prime on demand if not pre-populated
-            if (!_hasInjectPoint.ContainsKey(type)) PrimeInjectionCache(type);
-            return _hasInjectPoint.TryGetValue(type, out var v) && v;
-        }
-
-        public static FieldInfo[] GetInjectFields(Type type)
-        {
-            if (!_injectFields.TryGetValue(type, out var fields))
-            {
-                PrimeInjectionCache(type);
-                fields = _injectFields.TryGetValue(type, out var f) ? f : Array.Empty<FieldInfo>();
-            }
-            return fields;
-        }
-
-        public static MethodInfo[] GetInjectMethods(Type type)
-        {
-            if (!_injectMethods.TryGetValue(type, out var methods))
-            {
-                PrimeInjectionCache(type);
-                methods = _injectMethods.TryGetValue(type, out var m) ? m : Array.Empty<MethodInfo>();
-            }
-            return methods;
-        }
-
-        // ── [Resolve] accessors ─────────────────────────────────────────
-
-        public static bool TypeNeedsComponentResolution(Type type)
-        {
-            lock (_injectionSetLock) { if (_typesNeedingComponentResolution.Contains(type)) return true; }
-            if (!_hasResolvePoint.ContainsKey(type)) PrimeInjectionCache(type);
-            return _hasResolvePoint.TryGetValue(type, out var v) && v;
-        }
-
-        /// <summary>
-        /// Fast check: does this type need ANY form of injection?
-        /// Used by scene scanning to skip irrelevant MonoBehaviours instantly — O(1) HashSet lookup.
-        /// Primes on demand: Initialize() may have missed the type (e.g. an internal
-        /// type when the startup scan ran under different assembly state), and this
-        /// method is the ONLY gate for scene-wide injection — a false negative here
-        /// would silently skip the component's [Inject]/[Resolve] fields forever.
-        /// </summary>
-        public static bool TypeNeedsAnyInjection(Type type)
-        {
-            lock (_injectionSetLock)
-            {
-                if (_typesNeedingContainerInjection.Contains(type) ||
-                    _typesNeedingComponentResolution.Contains(type))
-                    return true;
-            }
-
-            // Lazy prime — mirrors TypeNeedsContainerInjection's fallback.
-            if (!_hasInjectPoint.ContainsKey(type) || !_hasResolvePoint.ContainsKey(type))
-                PrimeInjectionCache(type);
-
-            return (_hasInjectPoint.TryGetValue(type, out var inject) && inject) ||
-                   (_hasResolvePoint.TryGetValue(type, out var resolve) && resolve);
-        }
-
-        public static FieldInfo[] GetResolveFields(Type type)
-        {
-            if (!_resolveFields.TryGetValue(type, out var fields))
-            {
-                PrimeInjectionCache(type);
-                fields = _resolveFields.TryGetValue(type, out var f) ? f : Array.Empty<FieldInfo>();
-            }
-            return fields;
-        }
-
-        // ── Constructor cache (for DiContainer) ─────────────────────────
-
-        public static ConstructorInfo GetConstructor(Type type)
-        {
-            return _constructorCache.GetOrAdd(type, t =>
-            {
-                var allCtors = t.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                var publicCtors = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
-
-                var ctor = allCtors.FirstOrDefault(c => c.IsDefined(typeof(InjectAttribute), inherit: false))
-                        ?? (publicCtors.Length == 1 ? publicCtors[0] : null);
-
-                if (ctor != null) return ctor;
-
-                throw publicCtors.Length > 1
-                    ? new InvalidOperationException(
-                        $"Type '{t.FullName}' has {publicCtors.Length} public constructors. " +
-                        "Annotate the intended one with [Inject] to remove ambiguity.")
-                    : new InvalidOperationException(
-                        $"Type '{t.FullName}' has no accessible constructors. " +
-                        "Add a public constructor or annotate one with [Inject].");
-            });
-        }
-
-        public static Type[] GetConstructorParamTypes(Type type)
-        {
-            return _constructorParamCache.GetOrAdd(type, t =>
-            {
-                var ctor = GetConstructor(t);
-                return ctor.GetParameters().Select(p => p.ParameterType).ToArray();
-            });
-        }
-
-        public static Func<object[], object> GetConstructorDelegate(Type type)
-        {
-            // Uses direct ctor.Invoke instead of Expression trees — AOT-safe for IL2CPP/WebGL.
-            return _constructorDelegateCache.GetOrAdd(type, _ => args => GetConstructor(type).Invoke(args));
-        }
-
-        /// <summary>
-        /// Clears all cached metadata. Called on domain reload in Editor and on subsystem registration.
-        /// </summary>
+        /// <summary>Clears every cached plan and the container's static reflection caches.</summary>
         public static void ClearCache()
         {
-            _injectFields.Clear();
-            _injectMethods.Clear();
-            _hasInjectPoint.Clear();
-            _resolveFields.Clear();
-            _hasResolvePoint.Clear();
-            _constructorCache.Clear();
-            _constructorParamCache.Clear();
-            _constructorDelegateCache.Clear();
-            lock (_injectionSetLock)
+            MainThread.Assert(nameof(ClearCache));
+            s_plans.Clear();
+            DiContainer.ClearStaticCaches();
+        }
+
+        private static TypePlan Build(Type type)
+        {
+            var hierarchy = new List<Type>(4);
+            for (var t = type; t != null && !IsEngineOrFrameworkType(t); t = t.BaseType)
+                hierarchy.Add(t);
+            hierarchy.Reverse(); // base classes first
+
+            List<FieldInfo> injectFields = null;
+            List<InjectMethodPlan> injectMethods = null;
+            List<ResolveFieldPlan> resolveFields = null;
+            HashSet<MethodInfo> seenDefinitions = null;
+
+            for (int h = 0; h < hierarchy.Count; h++)
             {
-                _typesNeedingContainerInjection.Clear();
-                _typesNeedingComponentResolution.Clear();
+                var current = hierarchy[h];
+
+                var fields = current.GetFields(DeclaredMembers);
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    var field = fields[i];
+                    if (field.IsDefined(typeof(InjectAttribute), false))
+                        (injectFields ?? (injectFields = new List<FieldInfo>())).Add(field);
+
+                    if (field.IsDefined(typeof(ResolveAttribute), false) && TryPlanResolveField(field, type, out var resolvePlan))
+                        (resolveFields ?? (resolveFields = new List<ResolveFieldPlan>())).Add(resolvePlan);
+                }
+
+                var methods = current.GetMethods(DeclaredMembers);
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    var method = methods[i];
+                    if (!method.IsDefined(typeof(InjectAttribute), false) || method.IsGenericMethodDefinition)
+                        continue;
+
+                    // A virtual method and its overrides share one base definition. Invoking the
+                    // base MethodInfo already dispatches to the override, so run the body once.
+                    if (!(seenDefinitions ?? (seenDefinitions = new HashSet<MethodInfo>())).Add(method.GetBaseDefinition()))
+                        continue;
+
+                    (injectMethods ?? (injectMethods = new List<InjectMethodPlan>())).Add(
+                        new InjectMethodPlan(method, method.GetParameters()));
+                }
             }
+
+            return new TypePlan(
+                type,
+                injectFields != null ? injectFields.ToArray() : Array.Empty<FieldInfo>(),
+                injectMethods != null ? injectMethods.ToArray() : Array.Empty<InjectMethodPlan>(),
+                resolveFields != null ? resolveFields.ToArray() : Array.Empty<ResolveFieldPlan>());
+        }
+
+        private static bool TryPlanResolveField(FieldInfo field, Type owner, out ResolveFieldPlan plan)
+        {
+            var fieldType = field.FieldType;
+            if (!typeof(Component).IsAssignableFrom(fieldType) && !fieldType.IsInterface)
+            {
+                // Reported once per type, when the plan is built, instead of on every injection.
+                Debug.LogWarning(
+                    $"[ComponentResolver] [Resolve] '{field.Name}' on '{owner.Name}' - " +
+                    $"'{fieldType.Name}' is not a Unity Component or an interface. Field skipped.");
+                plan = default;
+                return false;
+            }
+
+            var attribute = (ResolveAttribute)Attribute.GetCustomAttribute(field, typeof(ResolveAttribute), false);
+            plan = new ResolveFieldPlan(field, attribute.Source, attribute.Optional);
+            return true;
+        }
+
+        private static bool IsEngineOrFrameworkType(Type type)
+        {
+            if (type == typeof(object)) return true;
+            var ns = type.Namespace;
+            if (ns == null) return false;
+            return ns == "System" || ns.StartsWith("System.", StringComparison.Ordinal)
+                || ns == "UnityEngine" || ns.StartsWith("UnityEngine.", StringComparison.Ordinal);
         }
     }
 }

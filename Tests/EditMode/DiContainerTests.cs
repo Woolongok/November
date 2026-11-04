@@ -83,6 +83,11 @@ namespace November.DI.Tests
             public DependingService(IDep dep) => Dep = dep;
         }
 
+        private sealed class ScopeOnlyService : IService
+        {
+            public ScopeOnlyService() { }
+        }
+
         // ── Lifecycle ───────────────────────────────────────────────
 
         [SetUp]
@@ -212,8 +217,8 @@ namespace November.DI.Tests
         public void TryResolve_SingletonConstructionFailure_Rethrows_InsteadOfMaskingAsMiss()
         {
             _container.RegisterFactory<IService>(c => throw new InvalidOperationException("boom"), Lifetime.Singleton);
-            LogAssert.Expect(LogType.Error, new Regex("Singleton construction failed"));
 
+            // The container no longer logs on the way up: the exception itself carries the diagnosis.
             Assert.Throws<InvalidOperationException>(() => _container.TryResolve<IService>(out _));
         }
 
@@ -261,6 +266,35 @@ namespace November.DI.Tests
 
                 Assert.AreEqual(2, all.Count);
             }
+        }
+
+        [Test]
+        public void ResolveAll_IncludesAncestorsFirst_AndCanExcludeThem()
+        {
+            _container.Add<IService, ServiceImpl>();
+            _container.Add<IService, CountingService>();
+
+            using (var scope = _container.CreateScope())
+            {
+                scope.Add<IService, ScopeOnlyService>();
+
+                var all = new List<IService>(scope.ResolveAll<IService>());
+                var local = new List<IService>(scope.ResolveAll<IService>(includeParents: false));
+
+                Assert.AreEqual(3, all.Count);
+                Assert.IsInstanceOf<ServiceImpl>(all[0]);
+                Assert.IsInstanceOf<CountingService>(all[1]);
+                Assert.IsInstanceOf<ScopeOnlyService>(all[2]);
+
+                Assert.AreEqual(1, local.Count);
+                Assert.IsInstanceOf<ScopeOnlyService>(local[0]);
+            }
+        }
+
+        [Test]
+        public void PrettyName_FormatsGenericTypesWithoutMetadataArity()
+        {
+            Assert.AreEqual("Func<IService>", DiContainer.PrettyName(typeof(Func<IService>)));
         }
 
         // ── Factories ───────────────────────────────────────────────

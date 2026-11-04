@@ -1,63 +1,86 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading;
+using UnityEngine.Scripting;
 
 namespace November.DI
 {
-
     /// <summary>
-    /// DiContainer factory partition: Func&lt;T&gt; / Lazy&lt;T&gt; open-generic support.
-    /// Same type via partial — no behaviour change.
+    /// Func&lt;T&gt; / Lazy&lt;T&gt; support.
+    ///
+    /// AOT / IL2CPP: the closed wrappers are created with MakeGenericMethod, which is safe for reference-type
+    /// arguments (shared generic code) but needs an explicit instantiation for value types that never appear as a
+    /// generic argument in compiled code. Services are almost always reference types; if you do resolve
+    /// Func&lt;SomeStruct&gt;, reference that exact type once in your own code. The wrappers carry [Preserve] and
+    /// the package ships a link.xml so stripping cannot remove them.
+    ///
+    /// The generic wrapper is turned into a typed delegate once per T, so each resolve is a delegate call:
+    /// no MethodInfo.Invoke and no object[] per call.
     /// </summary>
-    public sealed partial class DiContainer : IDiScope, IServiceProvider, IScopeFactory
+    public sealed partial class DiContainer
     {
-        // ── AOT / IL2CPP WARNING ───────────────────────────────────────
-        // MakeGenericMethod with a runtime-only Type is NOT safe under full-AOT
-        // backends (IL2CPP, WebGL). If Resolve(typeof(Func<T>)) is called for a T
-        // that never otherwise appears as a generic argument in compiled code,
-        // it throws ExecutionEngineException at runtime. Mitigation: reference
-        // typeof(Func<YourType>) / typeof(Lazy<YourType>) in an AotGenericHints.cs file.
-        private static readonly Dictionary<Type, MethodInfo> _factoryWrapperCache = new();
-        private static readonly Dictionary<Type, MethodInfo> _lazyWrapperCache = new();
-        private static readonly object _factoryCacheLock = new();
+        // The container is main-thread-only, so ordinary dictionaries avoid concurrent-collection
+        // overhead and keep every static cache under the same threading contract.
+        private static readonly Dictionary<Type, Func<DiContainer, object>> s_funcCreators =
+            new Dictionary<Type, Func<DiContainer, object>>();
 
-        private static object CreateTypedFactory(Type returnType, Func<object> inner)
+        private static readonly Dictionary<Type, Func<DiContainer, object>> s_lazyCreators =
+            new Dictionary<Type, Func<DiContainer, object>>();
+
+        private static readonly Func<Type, Func<DiContainer, object>> s_buildFuncCreator = BuildFuncCreator;
+        private static readonly Func<Type, Func<DiContainer, object>> s_buildLazyCreator = BuildLazyCreator;
+
+        private object CreateFunc(Type returnType)
         {
-            MethodInfo method;
-            lock (_factoryCacheLock)
+            if (!s_funcCreators.TryGetValue(returnType, out var creator))
             {
-                if (!_factoryWrapperCache.TryGetValue(returnType, out method))
-                {
-                    method = typeof(DiContainer)
-                        .GetMethod(nameof(WrapFactory), BindingFlags.NonPublic | BindingFlags.Static)!
-                        .MakeGenericMethod(returnType);
-                    _factoryWrapperCache[returnType] = method;
-                }
+                creator = s_buildFuncCreator(returnType);
+                s_funcCreators.Add(returnType, creator);
             }
-
-            return method.Invoke(null, new object[] { inner });
+            return creator(this);
         }
 
-        internal static Func<T> WrapFactory<T>(Func<object> inner) => () => (T)inner();
-
-        private object CreateTypedLazy(Type innerType)
+        private object CreateLazy(Type valueType)
         {
-            MethodInfo method;
-            lock (_factoryCacheLock)
+            if (!s_lazyCreators.TryGetValue(valueType, out var creator))
             {
-                if (!_lazyWrapperCache.TryGetValue(innerType, out method))
-                {
-                    method = typeof(DiContainer)
-                        .GetMethod(nameof(WrapLazyInstance), BindingFlags.NonPublic | BindingFlags.Instance)!
-                        .MakeGenericMethod(innerType);
-                    _lazyWrapperCache[innerType] = method;
-                }
+                creator = s_buildLazyCreator(valueType);
+                s_lazyCreators.Add(valueType, creator);
             }
-
-            return method.Invoke(this, null);
+            return creator(this);
         }
 
-        internal Lazy<T> WrapLazyInstance<T>() => new(() => (T)Resolve(typeof(T)));
+        private static Func<DiContainer, object> BuildFuncCreator(Type returnType)
+            => BuildCreator(nameof(MakeFunc), returnType);
+
+        private static Func<DiContainer, object> BuildLazyCreator(Type valueType)
+            => BuildCreator(nameof(MakeLazy), valueType);
+
+        private static Func<DiContainer, object> BuildCreator(string methodName, Type argument)
+        {
+            var method = typeof(DiContainer).GetMethod(methodName, BindingFlags.NonPublic | BindingFlags.Static);
+            return (Func<DiContainer, object>)method
+                .MakeGenericMethod(argument)
+                .CreateDelegate(typeof(Func<DiContainer, object>));
+        }
+
+        // Each invocation is a fresh resolution through the public API (disposed / thread guards included).
+        [Preserve]
+        private static object MakeFunc<T>(DiContainer container)
+            => new Func<T>(() => (T)container.Resolve(typeof(T)));
+
+        // PublicationOnly: a failed .Value is not cached, so it can succeed on a later call (for example after
+        // the missing service has been registered). The default mode would rethrow the first exception forever.
+        [Preserve]
+        private static object MakeLazy<T>(DiContainer container)
+            => new Lazy<T>(() => (T)container.Resolve(typeof(T)), LazyThreadSafetyMode.PublicationOnly);
+
+        /// <summary>Called when the domain is reset with "Enter Play Mode Options" (statics survive play sessions).</summary>
+        internal static void ClearStaticCaches()
+        {
+            s_funcCreators.Clear();
+            s_lazyCreators.Clear();
+        }
     }
-
 }
