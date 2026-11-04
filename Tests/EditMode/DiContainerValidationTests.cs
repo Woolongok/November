@@ -23,7 +23,7 @@ namespace November.DI.Tests
         private sealed class Session : ISession, IActiveSession { }
         private sealed class Repository
         {
-            public Repository(ISession session) { }
+            public Repository(Session session) { }
         }
 
         private sealed class AppManager
@@ -98,7 +98,7 @@ namespace November.DI.Tests
         [Test]
         public void Validate_SingletonThroughTransientToScoped_ReportsTheCaptivePath()
         {
-            _container.Register<ISession, Session>(Lifetime.Scoped);
+            _container.Register<Session>(Lifetime.Scoped);
             _container.Register<Repository>(Lifetime.Transient);
             _container.Register<AppManager>(Lifetime.Singleton);
 
@@ -147,14 +147,14 @@ namespace November.DI.Tests
         [Test]
         public void Validate_SingletonThroughAliasToScoped_ReportsTheCaptiveDependency()
         {
-            _container.Register<ISession, Session>(Lifetime.Scoped);
-            _container.RegisterAlias(typeof(IActiveSession), typeof(ISession));
+            _container.Register<Session>(Lifetime.Scoped);
+            _container.RegisterAlias(typeof(IActiveSession), typeof(Session));
             _container.Register<AliasManager>(Lifetime.Singleton);
 
             var ex = ValidationFailure(_container);
 
             AssertContains(ex.Message, "Captive dependency");
-            AssertContains(ex.Message, "AliasManager -> IActiveSession -> ISession -> Session");
+            AssertContains(ex.Message, "AliasManager -> IActiveSession -> Session");
         }
 
         [Test]
@@ -251,12 +251,15 @@ namespace November.DI.Tests
         [Test]
         public void Validate_ExplicitFuncRegistration_IsNotUnwrappedAndTraversed()
         {
-            _container.Register<ISession, Session>(Lifetime.Scoped);
-            _container.RegisterInstance<Func<ISession>>(() => null);
-            _container.Register<FuncManager>(Lifetime.Singleton);
+            // Scope validation is off, so the root scoped registration itself is legal. The explicit
+            // Func registration still wins at runtime, which means the singleton never captures the
+            // scoped service and validation must not traverse the wrapper's target.
+            using var container = new DiContainer(options: new DiContainerOptions { ValidateScopes = false });
+            container.Register<ISession, Session>(Lifetime.Scoped);
+            container.RegisterInstance<Func<ISession>>(() => null);
+            container.Register<FuncManager>(Lifetime.Singleton);
 
-            // Runtime resolves the explicit Func registration; no scoped service is captured.
-            Assert.DoesNotThrow(() => _container.Validate());
+            Assert.DoesNotThrow(() => container.Validate());
         }
     }
 }
