@@ -43,6 +43,12 @@ namespace November.DI.Tests
 
         private struct StructImpl : IService { }
 
+        private sealed class DisposableServiceImpl : IService, IDisposable
+        {
+            public int DisposeCount;
+            public void Dispose() => DisposeCount++;
+        }
+
         private sealed class Marker : MonoBehaviour { }
 
         private sealed class NeedsFunc
@@ -255,6 +261,59 @@ namespace November.DI.Tests
             Assert.Throws<ArgumentNullException>(() => _container.RegisterInstance<IService>(null));
         }
 
+        [Test]
+        public void Registration_WithAnUndefinedLifetime_Throws()
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                _container.Register<IService, ServiceImpl>((Lifetime)99));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                _container.RegisterFactory<IService>(p => new ServiceImpl(), (Lifetime)(-1)));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                _container.Replace(typeof(IService), typeof(ServiceImpl), (Lifetime)42));
+
+            Assert.IsFalse(_container.HasRegistration<IService>(), "a rejected registration must not be added");
+        }
+
+        [Test]
+        public void Registration_WithAnUnsupportedServiceType_Throws()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                _container.RegisterFactory(typeof(void), p => null));
+            Assert.Throws<ArgumentException>(() =>
+                _container.RegisterFactory(typeof(IList<>), p => null));
+            Assert.Throws<ArgumentException>(() =>
+                _container.RegisterInstance(typeof(IList<>), new List<int>()));
+            Assert.Throws<ArgumentException>(() =>
+                _container.RegisterAlias(typeof(IList<>), typeof(IService)));
+            Assert.Throws<ArgumentException>(() =>
+                _container.RegisterAlias(typeof(IService), typeof(IList<>)));
+
+            Assert.IsFalse(_container.HasRegistration<IService>(), "a rejected registration must not be added");
+        }
+
+        [Test]
+        public void Register_WithAnArrayOrDelegateImplementation_Throws()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                _container.Register(typeof(object), typeof(int[])));
+            Assert.Throws<ArgumentException>(() =>
+                _container.Register(typeof(object), typeof(Action)));
+        }
+
+        [Test]
+        public void FailedDuplicateInstanceRegistration_DoesNotTransferOwnership()
+        {
+            _container.Register<DisposableServiceImpl>(Lifetime.Singleton);
+            var service = _container.Resolve<DisposableServiceImpl>();
+
+            Assert.Throws<InvalidOperationException>(() =>
+                _container.RegisterInstance<DisposableServiceImpl>(service));
+
+            _container.Dispose();
+            Assert.AreEqual(1, service.DisposeCount,
+                "a rejected duplicate registration must not turn a container-owned singleton into a caller-owned instance");
+        }
+
         // ── Implicit Func / Lazy / collections ──────────────────────
 
         [Test]
@@ -348,13 +407,23 @@ namespace November.DI.Tests
         }
 
         [Test]
-        public void AliasCycle_IsReportedAsACircularDependency()
+        public void AliasCycle_IsRejectedWhenTheSecondAliasIsRegistered()
         {
             _container.RegisterAlias(typeof(IA), typeof(IB));
-            _container.RegisterAlias(typeof(IB), typeof(IA));
 
-            var ex = Assert.Throws<InvalidOperationException>(() => _container.Resolve<IA>());
-            Assert.IsTrue(ex.Message.Contains("Circular"), ex.Message);
+            var ex = Assert.Throws<ArgumentException>(() => _container.RegisterAlias(typeof(IB), typeof(IA)));
+
+            Assert.IsTrue(ex.Message.Contains("circular"), ex.Message);
+        }
+
+        [Test]
+        public void Alias_MayBeRegisteredBeforeItsTarget()
+        {
+            _container.Register<IDep, DepImpl>();
+            _container.RegisterAlias(typeof(IA), typeof(IB));
+            _container.Register<IB, Both>();
+
+            Assert.IsInstanceOf<Both>(_container.Resolve<IA>());
         }
 
         [Test]

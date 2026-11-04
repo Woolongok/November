@@ -65,8 +65,14 @@ namespace November.DI
             MainThread.Assert(nameof(RegisterAlias));
             if (aliasType == null) throw new ArgumentNullException(nameof(aliasType));
             if (targetType == null) throw new ArgumentNullException(nameof(targetType));
+            ValidateServiceType(aliasType, nameof(aliasType));
+            ValidateServiceType(targetType, nameof(targetType));
             if (aliasType == targetType)
                 throw new ArgumentException($"An alias cannot point at itself ('{aliasType.FullName}').", nameof(targetType));
+
+            // Reject a chain that already loops. Aliases whose target is registered later stay
+            // legal: the walk stops at the first registration that is not itself an alias.
+            ValidateAliasChain(aliasType, targetType);
 
             AddDescriptor(aliasType, ServiceDescriptor.ForAlias(aliasType, targetType), RegistrationMode.Register);
         }
@@ -78,15 +84,22 @@ namespace November.DI
             MainThread.Assert(nameof(Register));
             if (serviceType == null) throw new ArgumentNullException(nameof(serviceType));
             if (implType == null) throw new ArgumentNullException(nameof(implType));
+            ValidateServiceType(serviceType, nameof(serviceType));
+            ValidateLifetime(lifetime);
 
             if (implType.IsAbstract || implType.IsInterface)
                 throw new ArgumentException(
                     $"Implementation type '{implType.FullName}' must be a concrete, non-abstract type.",
                     nameof(implType));
-            if (implType.IsValueType || implType.ContainsGenericParameters || serviceType.ContainsGenericParameters)
+            if (implType.IsValueType || implType.ContainsGenericParameters || IsUnsupportedMetadataType(implType))
                 throw new ArgumentException(
                     $"Cannot register '{serviceType.FullName}' -> '{implType.FullName}': implementations must be closed classes " +
-                    "(structs and open generic types are not supported; register the closed type).",
+                    "(structs, open generic types, pointers and by-ref types are not supported; register the closed type).",
+                    nameof(implType));
+            if (implType.IsArray || typeof(Delegate).IsAssignableFrom(implType))
+                throw new ArgumentException(
+                    $"'{implType.FullName}' cannot be constructed by the container. Register a concrete class, an instance, " +
+                    "or a factory instead.",
                     nameof(implType));
             if (!serviceType.IsAssignableFrom(implType))
                 throw new ArgumentException(
@@ -101,6 +114,7 @@ namespace November.DI
             ThrowIfDisposed();
             MainThread.Assert(nameof(RegisterInstance));
             if (serviceType == null) throw new ArgumentNullException(nameof(serviceType));
+            ValidateServiceType(serviceType, nameof(serviceType));
             if (instance == null || IsDestroyedUnityObject(instance))
                 throw new ArgumentNullException(nameof(instance), "Cannot register a null or destroyed Unity object.");
             if (!serviceType.IsInstanceOfType(instance))
@@ -108,12 +122,14 @@ namespace November.DI
                     $"Instance of '{instance.GetType().FullName}' is not assignable to '{serviceType.FullName}'.",
                     nameof(instance));
 
+            AddDescriptor(serviceType, ServiceDescriptor.ForInstance(serviceType, instance), mode);
+
             // Caller-owned: a factory that forwards this object later must not claim it, and this
             // container must not dispose it even if it was previously tracked by the same scope.
+            // Both steps happen only after AddDescriptor succeeded, so a duplicate registration
+            // cannot silently transfer ownership of an object the container already owns.
             ObjectOwnership.MarkExternal(instance);
             ForgetTrackedInstance(instance);
-
-            AddDescriptor(serviceType, ServiceDescriptor.ForInstance(serviceType, instance), mode);
         }
 
         private void RegisterFactoryCore(Type serviceType, Func<IDiProvider, object> factory, Lifetime lifetime, RegistrationMode mode)
@@ -122,8 +138,52 @@ namespace November.DI
             MainThread.Assert(nameof(RegisterFactory));
             if (serviceType == null) throw new ArgumentNullException(nameof(serviceType));
             if (factory == null) throw new ArgumentNullException(nameof(factory));
+            ValidateServiceType(serviceType, nameof(serviceType));
+            ValidateLifetime(lifetime);
 
             AddDescriptor(serviceType, ServiceDescriptor.ForFactory(serviceType, factory, lifetime), mode);
+        }
+
+        private static void ValidateServiceType(Type serviceType, string parameterName)
+        {
+            if (IsUnsupportedMetadataType(serviceType))
+                throw new ArgumentException(
+                    $"'{serviceType}' cannot be used as a service type. Service types must be closed, non-void, " +
+                    "non-pointer and non-by-ref types; open generic definitions are not supported.",
+                    parameterName);
+        }
+
+        private static bool IsUnsupportedMetadataType(Type type)
+            => type == typeof(void) || type.IsByRef || type.IsPointer || type.IsByRefLike || type.ContainsGenericParameters;
+
+        private static void ValidateLifetime(Lifetime lifetime)
+        {
+            if (lifetime != Lifetime.Transient && lifetime != Lifetime.Singleton && lifetime != Lifetime.Scoped)
+                throw new ArgumentOutOfRangeException(
+                    nameof(lifetime), lifetime,
+                    $"Lifetime value {(int)lifetime} is not defined. Use Transient, Singleton or Scoped.");
+        }
+
+        /// <summary>
+        /// Walks the registrations the new alias would forward through. A loop through existing
+        /// aliases is rejected now instead of surfacing as a circular dependency on first resolve.
+        /// </summary>
+        private void ValidateAliasChain(Type aliasType, Type targetType)
+        {
+            var visited = new HashSet<Type>();
+            var current = targetType;
+            while (current != null && visited.Add(current))
+            {
+                if (current == aliasType)
+                    throw new ArgumentException(
+                        $"Alias '{aliasType.FullName}' -> '{targetType.FullName}' would create a circular alias chain.",
+                        nameof(targetType));
+
+                if (!FindDescriptor(current, out var descriptor, out _) || descriptor.Kind != DescriptorKind.Alias)
+                    return;
+
+                current = descriptor.ImplementationType;
+            }
         }
 
         private void AddDescriptor(Type serviceType, ServiceDescriptor descriptor, RegistrationMode mode)
