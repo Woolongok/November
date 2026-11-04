@@ -64,6 +64,10 @@ to do about it.
   `DiContainerOptions`.**
 - **Two `[Inject]` constructors on one type are an error** that says so, instead
   of the first one being picked silently. Mark exactly one.
+- **Static `[Inject]` fields/methods, static `[Resolve]` fields, and generic
+  `[Inject]` methods are rejected.** They were previously skipped silently.
+  Remove the attribute, make the member an instance member, or use a
+  non-generic method.
 
 ### Added
 
@@ -118,6 +122,12 @@ to do about it.
   which thread is "main". Static caches are reset for "Enter Play Mode Options".
 - `TryResolve`'s miss warning is once per type per root container instead of a
   process-wide static.
+- `[Inject]` fields and methods now run in declaration order within a declaring
+  type instead of unspecified reflection order.
+- Registration validates before mutating state. Undefined `Lifetime` values,
+  open generic / pointer / by-ref / void service types, and non-constructible
+  implementations (arrays, delegates) are rejected; a second alias that closes a
+  cycle is rejected at registration instead of on first resolve.
 - Documentation comments were corrected and the README documents ownership,
   injection order, options and stripping.
 
@@ -133,6 +143,29 @@ to do about it.
 - `TryResolve` hiding real construction failures behind `false`.
 - A missing-registration exception now stores the full resolution path, including the
   missing type, in `exception.Data[DiContainer.ResolutionPathKey]`.
+- `Validate()` disagreeing with runtime resolution: it now follows transients,
+  deferred `Func<T>` / `Lazy<T>` targets, collection bindings, aliases, and child
+  scope overrides. Factories remain opaque by design.
+- Cross-scope double disposal and ownership transfer. A factory forwarding a
+  parent-owned singleton no longer lets the child claim it, a cached borrowed
+  reference is not served after its owner is disposed, and a rejected duplicate
+  `RegisterInstance` no longer strips the container's ownership or tracking.
+- `DisposeAsync()` returning early for later callers. All callers now await the
+  same cleanup task; `Dispose()` during a running async cleanup logs an explicit
+  error instead of reporting success.
+- Failed prefab injection destroying only the requested component and leaving the
+  cloned GameObject hierarchy alive. The cloned root, its components and its
+  children are now removed.
+- Factory results being injected or cached before validation, and half-built
+  factory results leaking on failed injection. Null, destroyed, and incompatible
+  results are rejected, and failed construction cleans up `IDisposable`,
+  `IAsyncDisposable` (when synchronous), and Unity objects without touching
+  caller-owned or already-owned objects.
+- Injection markers surviving a new play session with domain reload disabled, so
+  a previously injected object could be skipped. Markers are now epoch-scoped and
+  reset with the static caches.
+- Static and generic injection members being silently ignored; they now fail with
+  an error naming the member.
 
 ## [1.0.0]
 

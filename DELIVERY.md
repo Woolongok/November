@@ -1,5 +1,19 @@
 # November.DI 2.0.0 — delivery and verification report
 
+## Post-review repair status
+
+The static review fixes were applied in phased commits after the initial delivery:
+
+1. dependency validation regression tests and a scope-aware `Validate()`;
+2. centralized ownership, cross-scope-safe disposal and idempotent `DisposeAsync()`;
+3. prefab hierarchy cleanup and factory-result validation/cleanup;
+4. registration hardening and transactional validation;
+5. injection metadata validation, deterministic member order and epoch-scoped markers.
+
+After those phases the .NET rig reports **186 passed, 0 failed**. This is still a
+stub-based run: Unity Editor execution, real PlayMode behavior and IL2CPP builds
+remain unverified, as described below.
+
 ## Integration status (target repository)
 
 The delivery was integrated into the package repository at its root:
@@ -8,8 +22,8 @@ The delivery was integrated into the package repository at its root:
 - Existing `.meta` files from the repository were preserved. The paths listed below as missing-original metadata are present here; `Runtime/IServiceProvider.cs` and its `.meta` were removed for the `IDiProvider` rename.
 - The CI workflow stages the package under `.ci/package` before running GameCI package mode, because GameCI hangs when the package directory is the repository root.
 - Integration fixes: `NotRegistered` now attaches the full path (including the missing type) to `exception.Data`; the two throwing-disposal tests declare their expected error logs to Unity's `LogAssert`; the rig stub gained `GameObject.GetComponentInChildren`.
-- `dotnet run --project Tools~/rig/rig.csproj -p:RuntimeDir=../../Runtime -p:TestsDir=../../Tests` ran on .NET SDK 10.0.402: **148 passed, 0 failed**.
-- Unity Editor, PlayMode under the real engine and IL2CPP builds were still not run; the rig compiles the runtime and all 148 source tests against stubs.
+- `dotnet run --project Tools~/rig/rig.csproj -p:RuntimeDir=../../Runtime -p:TestsDir=../../Tests` ran on .NET SDK 10.0.402: **186 passed, 0 failed** after the post-review repairs.
+- Unity Editor, PlayMode under the real engine and IL2CPP builds were still not run; the rig compiles the runtime and all 186 source tests against stubs.
 
 ## Original delivery verification status
 

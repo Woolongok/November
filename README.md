@@ -138,8 +138,19 @@ A scope never builds an object from its parent's point of view: a transient or
 scoped service registered on the root but resolved through a child scope sees
 the child's registrations (and local overrides) for all of its dependencies.
 
+Ownership follows the scope that actually builds the object, not the scope that
+happens to hold the registration. Singletons belong to the container that owns
+their registration; scoped and transient disposables belong to the resolving
+scope. Ownership is tracked centrally by object identity, so a factory that
+forwards a parent singleton through a child scope cannot make the child claim or
+dispose it. An object is disposed once, by its real owner; a cached reference to
+an object whose owner was already disposed is not served again.
+
 `RegisterInstance` hands out an object the caller owns. It is never injected and
-never disposed by the container.
+never disposed by the container. Registering an object the container had already
+built transfers ownership back to the caller. Replacing a binding drops the old
+cached reference immediately but disposes the old instance later, when its owning
+scope is disposed, in reverse creation order.
 
 ### Registration
 
@@ -182,6 +193,14 @@ scene load, set
 `DiContainerOptions.DuplicateRegistrations = DuplicateRegistrationPolicy.ReplaceWithWarning`
 for the old replace-and-warn behavior while you migrate to `Replace`.
 
+Registration validates before it changes anything. A lifetime must be one of
+`Transient`, `Singleton`, or `Scoped`; service and implementation types must be
+closed, non-void, non-pointer, non-by-ref types; implementations must be concrete
+classes rather than structs, arrays, delegates, open generic types, or
+`UnityEngine.Object` types. An alias whose target already leads back to it is
+rejected when the second alias is registered. A rejected registration leaves
+existing bindings, caches, and ownership untouched.
+
 ### Resolution
 
 ```csharp
@@ -201,6 +220,9 @@ var has = container.HasRegistration<IService>();      // silent probe, never log
   thread all propagate. The first miss per type logs one warning per root
   container; turn that off with `DiContainerOptions.WarnOnTryResolveMiss`, or
   probe with `HasRegistration`.
+- A factory result is checked before injection or caching. Null, a destroyed
+  Unity object, or a value that is not assignable to the registered service type
+  throws immediately and is never placed in the resolution cache.
 - `Func<T>` and `Lazy<T>` work for any resolvable `T` without registering them.
   `Func<T>` resolves again on every call; `Lazy<T>` resolves on first `.Value`,
   and a failed `.Value` is **not** cached, so it can succeed on a later call.
@@ -213,7 +235,8 @@ var has = container.HasRegistration<IService>();      // silent probe, never log
 
 Order for an object the container builds: constructor, then `[Inject]` fields
 (base classes first), then `[Inject]` methods (base classes first), then `[Resolve]`
-fields.
+fields. Within one declaring type, fields and methods run in declaration order,
+not reflection order.
 
 Every `[Inject]` dependency is required. A missing dependency aborts construction
 or `InjectInto`; `[Inject]` has no optional or best-effort mode.
@@ -222,6 +245,9 @@ or `InjectInto`; `[Inject]` has no optional or best-effort mode.
   the `[Inject]` constructor, or the single public constructor when there is
   exactly one. Two `[Inject]` constructors, or several public constructors
   without `[Inject]`, are an error that says so.
+- Static `[Inject]` fields and methods, static `[Resolve]` fields, and generic
+  `[Inject]` methods are rejected when the type is first inspected instead of
+  being silently ignored.
 - Private fields and private base-class members are injected.
 - Auto-properties use the field target: `[field: Inject] public IFoo Foo { get; private set; }`.
 - A virtual `[Inject]` method runs once, not once per override.
@@ -267,25 +293,34 @@ container.InjectGameObjectHierarchy(existingRoot);              // inactive chil
 `InstantiatePrefab` clones under a hidden inactive holder, injects the whole
 hierarchy, then re-parents the clone, which activates it when its own state and
 the new parent allow. `Awake` and `OnEnable` therefore see every `[Inject]` and
-`[Resolve]` field. If injection fails the clone is destroyed and the exception is
-rethrown. A `ScriptableObject` can be passed too; it is cloned and injected.
-`InjectGameObjectHierarchy` cannot help objects that already ran `Awake`.
+`[Resolve]` field. If injection fails the cloned root GameObject is destroyed,
+along with its components and children, and the exception is rethrown; the source
+prefab is untouched. A `ScriptableObject` can be passed too; it is cloned and
+injected. `InjectGameObjectHierarchy` cannot help objects that already ran `Awake`.
 Missing-script entries in a hierarchy are skipped with a warning.
 
 ### Scopes and disposal
 
 - Child scopes inherit parent registrations and can override them locally.
 - A scope disposes, in reverse creation order, every `IDisposable` /
-  `IAsyncDisposable` it built: its singletons, its scoped services, and the
-  transient disposables resolved **through it**. The same object is disposed once
-  even if two registrations hand it out. `RegisterInstance` objects are not
-  disposed.
+  `IAsyncDisposable` it built and owns: its singletons, its scoped services, and
+  the transient disposables resolved **through it**. The same object is disposed
+  once across all scopes, even when two registrations or a forwarding factory
+  hand it out. `RegisterInstance` objects are not disposed.
 - Disposing a parent does not dispose child scopes. Each scope is an independent
   lifetime boundary and must be disposed separately.
 - `await scope.DisposeAsync()` awaits `IAsyncDisposable` instances (preferred
-  over `IDisposable` when a type has both). Plain `Dispose()` accepts an async
-  disposal that finishes synchronously and reports one that does not, rather than
-  blocking the main thread.
+  over `IDisposable` when a type has both). Every caller made while cleanup is
+  running awaits the same completion task, so `DisposeAsync` is idempotent.
+  Plain `Dispose()` accepts an async disposal that finishes synchronously; if the
+  scope is already being disposed asynchronously it logs an error naming the
+  still-running cleanup instead of blocking the main thread or pretending the
+  work finished.
+- If construction or injection fails, the half-built object is cleaned up before
+  the exception escapes: a Unity object is destroyed, an `IDisposable` is
+  disposed, and an async-only disposable is cleaned up when it completes
+  synchronously (otherwise an error explains what was left behind). Caller-owned
+  and already-owned objects are never cleaned up by the failing attempt.
 - Everything on a disposed scope throws `ObjectDisposedException`. A live child of
   a disposed parent that needs one of the parent's singletons gets an error that
   says the owner was disposed.
@@ -299,15 +334,29 @@ Missing-script entries in a hierarchy are skipped with a warning.
 `ValidateScopes` (default **on** in the Editor and development builds, off in
 release builds) rejects a scoped service resolved straight from the root container
 and singletons that capture scoped services, both of which would otherwise
-silently behave like singletons.
+silently behave like singletons. A singleton owned by a child scope and a scoped
+service resolved by that same child are released together, so that pair is valid.
 
-`container.Validate()` analyses the registrations without constructing anything
-and throws one exception listing every problem: unregistered dependencies
-(constructor, `[Inject]` field, `[Inject]` method), ambiguous constructors,
-dependency cycles, captive dependencies, dead instances and dangling aliases.
-Factories are opaque and are not analysed; `Func<T>` / `Lazy<T>` edges are lazy
-and are not cycles. `container.DescribeRegistrations()` returns a readable dump
-of every scope level for debugging.
+`container.Validate()` walks every registration visible from the scope without
+constructing anything and throws one exception listing every problem. It uses the
+same view as resolution:
+
+- a singleton is checked from its owning container's perspective, while scoped
+  and transient services are checked from the resolving scope;
+- an alias keeps the consumer's resolution scope and lifetime; it is a graph
+  edge, not a new lifetime boundary;
+- a collection expands to each visible binding in `ResolveAll` order;
+- `Func<T>` / `Lazy<T>` are deferred for cycle detection, so they can break an
+  eager cycle, but their target is still checked for registration, graph
+  validity, scope, and lifetime compatibility.
+
+It reports unregistered constructor and `[Inject]` dependencies, ambiguous
+constructors, eager cycles, captive dependencies, dead instances, and dangling
+aliases, including the full dependency path. Factory delegates are opaque: their
+bodies cannot be inspected, so a graph that is invalid only inside a factory is
+not detected by `Validate()` (the factory result checks still apply at runtime).
+`container.DescribeRegistrations()` returns a readable dump of every scope level
+for debugging.
 
 ### Options
 
@@ -351,9 +400,10 @@ constructors and `[Inject]` members that nothing else references.
 Everything, including `InjectionQuery` and the metadata cache, is main-thread
 only; there is no cross-thread safety guarantee. In the Editor and development
 builds, wrong-thread container calls throw. Those assertions are omitted from
-release builds. Metadata is built lazily per type and reset on domain reload and
-when entering play mode with "Enter Play Mode Options" so no state leaks between
-play sessions.
+release builds. Metadata is built lazily per type. Its cache, the `Func<T>` /
+`Lazy<T>` creator caches, and the injection-marker epoch are reset on domain
+reload and when entering play mode with "Enter Play Mode Options", so objects
+marked as injected in a previous play session are injected again.
 
 ## Tests
 
