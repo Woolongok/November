@@ -32,22 +32,29 @@ namespace November.DI
             try
             {
                 var instance = descriptor.Kind == DescriptorKind.Factory
-                    ? InvokeFactory(descriptor)
+                    ? descriptor.Factory(this)
                     : CreateInstance(descriptor.ImplementationType);
 
-                var plan = InjectionMetadata.GetPlan(instance.GetType());
-                bool alreadyInjected = descriptor.Kind == DescriptorKind.Factory && s_injected.TryGetValue(instance, out _);
-                if (plan.NeedsAnyInjection && !alreadyInjected)
+                // Everything that can reject or mutate an instance happens inside the same failure
+                // boundary, so a half-built object is never cached or tracked.
+                try
                 {
-                    try { InjectCore(instance, plan); }
-                    catch
-                    {
-                        DisposeQuietly(instance);
-                        throw;
-                    }
-                }
+                    if (descriptor.Kind == DescriptorKind.Factory)
+                        ValidateFactoryResult(descriptor, instance);
 
-                return instance;
+                    var plan = InjectionMetadata.GetPlan(instance.GetType());
+                    bool alreadyInjected = descriptor.Kind == DescriptorKind.Factory
+                                           && s_injected.TryGetValue(instance, out _);
+                    if (plan.NeedsAnyInjection && !alreadyInjected)
+                        InjectCore(instance, plan);
+
+                    return instance;
+                }
+                catch
+                {
+                    CleanupFailedConstruction(instance);
+                    throw;
+                }
             }
             catch (Exception ex)
             {
@@ -60,13 +67,17 @@ namespace November.DI
             }
         }
 
-        private object InvokeFactory(ServiceDescriptor descriptor)
+        private static void ValidateFactoryResult(ServiceDescriptor descriptor, object result)
         {
-            var result = descriptor.Factory(this);
             if (result == null || IsDestroyedUnityObject(result))
                 throw new InvalidOperationException(
                     $"[DiContainer] The factory registered for '{PrettyName(descriptor.ServiceType)}' returned null.");
-            return result;
+
+            if (!descriptor.ServiceType.IsInstanceOfType(result))
+                throw new InvalidOperationException(
+                    $"[DiContainer] The factory registered for '{PrettyName(descriptor.ServiceType)}' returned " +
+                    $"'{PrettyName(result.GetType())}', which is not assignable to the registered service type. " +
+                    "A factory must never put an incompatible object into the resolution cache.");
         }
 
         private object CreateInstance(Type implementationType)
@@ -108,11 +119,57 @@ namespace November.DI
             return ex.InnerException; // unreachable
         }
 
-        private static void DisposeQuietly(object instance)
+        /// <summary>
+        /// Cleans up an object whose construction failed. Caller-owned and already-tracked objects
+        /// are left alone; a newly created Unity object is destroyed, an IDisposable is disposed,
+        /// and an async-only disposable is cleaned up only when it completes synchronously. Cleanup
+        /// never replaces the construction exception.
+        /// </summary>
+        private static void CleanupFailedConstruction(object instance)
         {
-            if (!(instance is IDisposable disposable)) return;
-            try { disposable.Dispose(); }
-            catch { /* the injection failure being thrown is the error that matters */ }
+            if (instance == null) return;
+
+            // External ownership or a previous successful construction: teardown is not this
+            // failure path's responsibility.
+            if (ObjectOwnership.TryGet(instance, out _)) return;
+
+            if (instance is Object unityObject)
+            {
+                DestroyObject(unityObject);
+                return;
+            }
+
+            if (instance is IDisposable disposable)
+            {
+                try { disposable.Dispose(); }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[DiContainer] Exception cleaning up failed construction of '{instance.GetType().Name}':\n{ex}");
+                }
+                return;
+            }
+
+            if (instance is IAsyncDisposable asyncDisposable)
+            {
+                try
+                {
+                    var pending = asyncDisposable.DisposeAsync();
+                    if (pending.IsCompleted)
+                    {
+                        pending.GetAwaiter().GetResult();
+                        return;
+                    }
+
+                    Debug.LogError(
+                        $"[DiContainer] Failed construction of '{instance.GetType().Name}' left it alive: its " +
+                        "IAsyncDisposable cleanup did not complete synchronously. Clean it up manually, or use a " +
+                        "type that also implements IDisposable.");
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[DiContainer] Exception cleaning up failed construction of '{instance.GetType().Name}':\n{ex}");
+                }
+            }
         }
 
         // ── Injection ───────────────────────────────────────────────────────

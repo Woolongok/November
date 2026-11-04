@@ -159,6 +159,27 @@ namespace November.DI.Tests
             public void Dispose() => Disposed++;
         }
 
+        private sealed class UnrelatedService
+        {
+        }
+
+        private sealed class AsyncOnlyFailingInject : IAsyncDisposable
+        {
+            public int Disposed;
+            [Inject] public void Init(IMissing missing) => throw new InvalidOperationException("inject failed");
+            public ValueTask DisposeAsync() { Disposed++; return default; }
+        }
+
+        private interface IExternalFactoryService { }
+        private interface IFactoryResultService { }
+
+        private sealed class ExternalFailingResult : IExternalFactoryService, IFactoryResultService, IDisposable
+        {
+            public int Disposed;
+            [Inject] public IMissing Missing;
+            public void Dispose() => Disposed++;
+        }
+
         private sealed class FieldCycleA { [Inject] public FieldCycleB B; }
         private sealed class FieldCycleB { [Inject] public FieldCycleA A; }
 
@@ -430,6 +451,60 @@ namespace November.DI.Tests
 
             var ex = Assert.Throws<InvalidOperationException>(() => _container.Resolve<IService>());
             Assert.IsTrue(ex.Message.Contains("returned null"), ex.Message);
+        }
+
+        [Test]
+        public void FactoryReturningAnIncompatibleType_ThrowsImmediately()
+        {
+            _container.RegisterFactory(typeof(IService), p => new UnrelatedService());
+
+            var ex = Assert.Throws<InvalidOperationException>(() => _container.Resolve<IService>());
+
+            Assert.IsTrue(ex.Message.Contains("not assignable"), ex.Message);
+            Assert.IsTrue(ex.Message.Contains("UnrelatedService"), ex.Message);
+        }
+
+        [Test]
+        public void FailedFactoryInjection_DisposesTheHalfBuiltResult()
+        {
+            _container.Register<IDep, DepImpl>();
+            _container.RegisterFactory<FailingInject>(p => new FailingInject());
+
+            var ex = Assert.Throws<InvalidOperationException>(() => _container.Resolve<FailingInject>());
+
+            Assert.AreEqual("inject failed", ex.Message);
+            Assert.AreEqual(1, FailingInject.Disposed);
+        }
+
+        [Test]
+        public void FailedFactoryInjection_DisposesAnAsyncOnlyResult_WhenCleanupCompletesSynchronously()
+        {
+            AsyncOnlyFailingInject created = null;
+            _container.RegisterFactory<AsyncOnlyFailingInject>(p =>
+            {
+                created = new AsyncOnlyFailingInject();
+                return created;
+            });
+
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                _container.Resolve(typeof(AsyncOnlyFailingInject)));
+
+            Assert.IsNotNull(created);
+            Assert.AreEqual(1, created.Disposed, "the async-only factory result must still be cleaned up");
+            Assert.IsTrue(ex.Message.Contains("IMissing"), ex.Message);
+        }
+
+        [Test]
+        public void FailedFactoryInjection_DoesNotCleanUpAnExternallyOwnedResult()
+        {
+            var external = new ExternalFailingResult();
+            _container.RegisterInstance<IExternalFactoryService>(external);
+            _container.RegisterFactory<IFactoryResultService>(
+                p => (IFactoryResultService)p.Resolve<IExternalFactoryService>());
+
+            Assert.Throws<InvalidOperationException>(() => _container.Resolve<IFactoryResultService>());
+
+            Assert.AreEqual(0, external.Disposed, "RegisterInstance objects stay caller-owned even when a factory forwards them");
         }
 
         [Test]
