@@ -62,7 +62,9 @@ namespace November.DI
             if (_inactiveHolder == null)
             {
                 var holder = new GameObject("[November.DI] Inactive Holder");
-                holder.hideFlags = HideFlags.HideAndDontSave;
+                // HideInHierarchy only: DontSave flags can keep an object alive across scene loads,
+                // which is unsafe for a holder that must stay in the active scene.
+                holder.hideFlags = HideFlags.HideInHierarchy;
                 holder.SetActive(false);
                 _inactiveHolder = holder;
             }

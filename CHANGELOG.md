@@ -119,7 +119,7 @@ to do about it.
   is now reported once per type.
 - Injection metadata is built lazily per type and cached; type walks stop at
   `System.*` and `UnityEngine.*`. Resolving a cached singleton no longer
-  allocates.
+  allocates (80 B → 0 B).
 - The main-thread id is re-captured when the Editor loads the domain and when the
   player starts, so the first thread to touch the container no longer decides
   which thread is "main". Static caches are reset for "Enter Play Mode Options".
