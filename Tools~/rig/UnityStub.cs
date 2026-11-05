@@ -28,12 +28,16 @@ namespace UnityEditor
 namespace UnityEngine.Scripting
 {
     [AttributeUsage(AttributeTargets.All)]
-    public sealed class PreserveAttribute : Attribute { }
+    public class PreserveAttribute : Attribute { }
 }
 
 namespace UnityEngine.SceneManagement
 {
-    public struct Scene { }
+    public struct Scene
+{
+    public static bool operator ==(Scene a, Scene b) => true;
+    public static bool operator !=(Scene a, Scene b) => false;
+}
     public static class SceneManager
     {
         public static Scene GetActiveScene() => default;
@@ -265,6 +269,7 @@ namespace UnityEngine
         internal readonly List<Component> ComponentList = new List<Component>();
         public bool activeSelf { get; private set; } = true;
         public Transform transform { get; }
+public UnityEngine.SceneManagement.Scene scene => default;
 
         public GameObject() : this("GameObject") { }
 

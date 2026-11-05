@@ -287,6 +287,10 @@ namespace November.DI
             }
 
             root.transform.SetParent(parent, false);
+
+            // Edit mode has no container lifetime to hang a hidden object on: do not leave one in the scene.
+            if (!Application.isPlaying) _state.ReleaseHolderIfEmpty();
+
             return instance;
         }
 

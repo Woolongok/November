@@ -1,12 +1,19 @@
 <!--
   Keeps November.DI itself intact under managed code stripping (IL2CPP / WebGL).
-  The container reaches its own generic helpers (Func<T> / Lazy<T> wrappers) only
-  through reflection, and a stripped build would otherwise remove them.
 
-  This does NOT preserve YOUR types: constructors, [Inject] members and [Resolve]
-  fields that are only touched by reflection can still be stripped. Mark them with
-  [UnityEngine.Scripting.Preserve] or list them in your project's own link.xml
-  (see README, "IL2CPP and stripping").
+  IMPORTANT: Unity reads link.xml files from Assets/ and from EMBEDDED packages (a package cloned into
+  your project's Packages/ folder). It does NOT read them from packages installed through Git or a
+  registry (Library/PackageCache). For those installs the package relies on [Preserve]: [Inject] and
+  [Resolve] derive from PreserveAttribute, and the Func<T> / Lazy<T> helpers the container reaches by
+  reflection are marked [Preserve]. To preserve the package assembly regardless of how it is installed,
+  add this to a link.xml in your own Assets/ folder:
+
+      <linker><assembly fullname="November.DI" preserve="all" /></linker>
+
+  This file does NOT preserve YOUR types: a constructor that is only reached by reflection (a type with
+  one public constructor and no [Inject]) can still be stripped. Mark the constructor [Inject], or the
+  class [Preserve] (keeps its default constructor), or list the assembly in your own link.xml
+  (see README, "IL2CPP and code stripping").
 -->
 <linker>
   <assembly fullname="November.DI" preserve="all" />

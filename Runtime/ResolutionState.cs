@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace November.DI
 {
@@ -56,6 +57,8 @@ namespace November.DI
         /// </summary>
         public GameObject GetInactiveHolder()
         {
+            if (_inactiveHolder != null && _inactiveHolder.scene != SceneManager.GetActiveScene()) ReleaseHolder();
+
             if (_inactiveHolder == null)
             {
                 var holder = new GameObject("[November.DI] Inactive Holder");
@@ -64,6 +67,15 @@ namespace November.DI
                 _inactiveHolder = holder;
             }
             return _inactiveHolder;
+        }
+
+        /// <summary>
+        /// Edit mode only: nothing disposes the holder between calls there, and a hidden object that is left
+        /// in a scene is saved with it. Skipped while a clone is still under it (a nested call).
+        /// </summary>
+        public void ReleaseHolderIfEmpty()
+        {
+            if (_inactiveHolder != null && _inactiveHolder.transform.childCount == 0) ReleaseHolder();
         }
 
         public void ReleaseHolder()

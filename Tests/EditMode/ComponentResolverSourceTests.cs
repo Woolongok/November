@@ -99,6 +99,29 @@ namespace November.DI.Tests
         }
 
         [Test]
+        public void Parent_IncludesInactiveParents()
+        {
+            // Everything below an inactive object is inactive in the hierarchy: exactly the state of a prefab clone
+            // while InstantiatePrefab injects it under the hidden holder.
+            var parent = new GameObject("parent");
+            var marker = parent.AddComponent<SourceMarker>();
+            _root.transform.SetParent(parent.transform, false);
+            var target = _root.AddComponent<ParentTarget>();
+            parent.SetActive(false);
+            try
+            {
+                ComponentResolver.Resolve(target);
+
+                Assert.AreSame(marker, target.Marker);
+            }
+            finally
+            {
+                _root.transform.SetParent(null, false);
+                Object.DestroyImmediate(parent);
+            }
+        }
+
+        [Test]
         public void Optional_MissingComponent_IsSilent_AndKeepsTheAssignedValue()
         {
             var other = new GameObject("other");

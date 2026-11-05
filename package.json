@@ -2,7 +2,7 @@
   "name": "com.woolongok.november",
   "version": "2.0.0",
   "displayName": "November DI",
-  "description": "A lightweight Unity dependency injection container with constructor, field, and method injection, scoped lifetimes, prefab instantiation, and [Resolve] component lookup.",
+  "description": "A lightweight Unity dependency injection container with constructor, field, and method injection, scoped lifetimes, aliases and multi-bindings, startup validation, prefab instantiation that injects before Awake, and [Resolve] component lookup.",
   "unity": "6000.0",
   "unityRelease": "0f1",
   "license": "MIT",
